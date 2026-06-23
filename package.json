@@ -1,0 +1,88 @@
+{
+  "name": "claude-ref-sender",
+  "displayName": "Claude Ref Sender",
+  "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
+  "version": "0.1.0",
+  "publisher": "your-publisher-id",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "cli",
+    "terminal",
+    "reference",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-name/claude-ref-sender.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-name/claude-ref-sender/issues"
+  },
+  "homepage": "https://github.com/your-name/claude-ref-sender#readme",
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeRef.sendSelection",
+        "title": "Claude Ref: 发送选区引用到终端"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claudeRef.sendSelection",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "claudeRef.sendSelection",
+          "group": "navigation@99",
+          "when": "editorTextFocus"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Ref Sender",
+      "properties": {
+        "claudeRef.pathStyle": {
+          "type": "string",
+          "enum": [
+            "relative",
+            "absolute"
+          ],
+          "default": "relative",
+          "description": "引用中使用的文件路径风格：relative 为相对工作区根目录，absolute 为绝对路径。"
+        },
+        "claudeRef.submitOnSend": {
+          "type": "boolean",
+          "default": false,
+          "description": "发送引用后是否自动回车提交。关闭时只把引用打入终端，方便你继续补充内容再回车。"
+        },
+        "claudeRef.terminalName": {
+          "type": "string",
+          "default": "",
+          "description": "目标终端名称。留空则使用当前活动终端；填写后会优先查找同名终端，找不到则新建。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.24.0"
+  }
+}
