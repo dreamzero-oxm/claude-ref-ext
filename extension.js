@@ -112,6 +112,45 @@ async function refsFromClipboard(pathStyle) {
   }
 }
 
+/**
+ * 在有非空选区时，于选区起始行上方渲染一个可单击的 CodeLens：
+ * 「💬 将选中引用添加到终端」，点击后执行 claudeRef.sendSelection 命令。
+ *
+ * CodeLens 默认只在文档变化时刷新，而选区变化不算文档变化，
+ * 因此需要在选区变化时主动 fire onDidChangeCodeLenses 触发重算。
+ * @implements {vscode.CodeLensProvider}
+ */
+class SendSelectionLensProvider {
+  constructor() {
+    this._onDidChange = new vscode.EventEmitter();
+    this.onDidChangeCodeLenses = this._onDidChange.event;
+  }
+
+  refresh() {
+    this._onDidChange.fire();
+  }
+
+  provideCodeLenses(document) {
+    const editor = vscode.window.activeTextEditor;
+    // 仅为当前活动编辑器、且其选区非空时提供
+    if (!editor || editor.document.uri.toString() !== document.uri.toString()) {
+      return [];
+    }
+    const sel = editor.selection;
+    if (sel.isEmpty) {
+      return [];
+    }
+    // 把 lens 挂在选区起始行（CodeLens 会渲染在该行上方）
+    const line = document.lineAt(sel.start.line);
+    return [
+      new vscode.CodeLens(line.range, {
+        title: '💬 将选中引用添加到终端',
+        command: 'claudeRef.sendSelection',
+      }),
+    ];
+  }
+}
+
 function activate(context) {
   // 编辑器中：选中代码 → @path#Lstart-end
   const sendSelection = vscode.commands.registerCommand('claudeRef.sendSelection', () => {
@@ -157,7 +196,18 @@ function activate(context) {
     }
   );
 
-  context.subscriptions.push(sendSelection, sendFile);
+  // 选中代码后在选区上方显示「将选中引用添加到终端」的 CodeLens
+  const lensProvider = new SendSelectionLensProvider();
+  const lensRegistration = vscode.languages.registerCodeLensProvider(
+    { scheme: '*' },
+    lensProvider
+  );
+  // 选区变化时主动刷新 CodeLens（选区变化不触发文档变化）
+  const selectionWatcher = vscode.window.onDidChangeTextEditorSelection(() => {
+    lensProvider.refresh();
+  });
+
+  context.subscriptions.push(sendSelection, sendFile, lensRegistration, selectionWatcher);
 }
 
 function deactivate() {}

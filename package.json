@@ -2,9 +2,13 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "0.1.0",
-  "publisher": "your-publisher-id",
+  "version": "1.0.0",
+  "publisher": "ByteFunc",
   "license": "MIT",
+  "icon": "icon.png",
+  "author": {
+    "name": "ByteFunc"
+  },
   "engines": {
     "vscode": "^1.70.0"
   },
@@ -21,13 +25,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-name/claude-ref-sender.git"
+    "url": "https://github.com/dreamzero-oxm/claude-ref-sender.git"
   },
   "bugs": {
-    "url": "https://github.com/your-name/claude-ref-sender/issues"
+    "url": "https://github.com/dreamzero-oxm/claude-ref-sender/issues"
   },
-  "homepage": "https://github.com/your-name/claude-ref-sender#readme",
-  "activationEvents": [],
+  "homepage": "https://github.com/dreamzero-oxm/claude-ref-sender#readme",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./extension.js",
   "contributes": {
     "commands": [

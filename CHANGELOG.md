@@ -5,6 +5,16 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.0] - 2026-06-23
+
+### 新增
+
+- 首个正式公开发布
+- 资源管理器文件引用：选中文件后通过快捷键或右键菜单（命令 `claudeRef.sendFile`）生成整文件引用 `@path`（不含行号）发送到终端；支持多选；快捷键路径经由内置复制路径命令读取选中项并还原剪贴板
+- 选区 CodeLens 气泡：选中代码后在选区上方显示可单击的「💬 将选中引用添加到终端」
+- `activationEvents` 设为 `onStartupFinished`，确保 CodeLens provider 提前注册
+- 扩展图标
+
 ## [0.1.0] - 2026-06-23
 
 ### 新增
