@@ -34,6 +34,10 @@
       {
         "command": "claudeRef.sendSelection",
         "title": "Claude Ref: 发送选区引用到终端"
+      },
+      {
+        "command": "claudeRef.sendFile",
+        "title": "Claude Ref: 发送文件引用到终端"
       }
     ],
     "keybindings": [
@@ -42,6 +46,12 @@
         "key": "ctrl+alt+k",
         "mac": "cmd+alt+k",
         "when": "editorTextFocus"
+      },
+      {
+        "command": "claudeRef.sendFile",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "filesExplorerFocus && !inputFocus"
       }
     ],
     "menus": {
@@ -50,6 +60,13 @@
           "command": "claudeRef.sendSelection",
           "group": "navigation@99",
           "when": "editorTextFocus"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "claudeRef.sendFile",
+          "group": "navigation@99",
+          "when": "!explorerResourceIsFolder"
         }
       ]
     },
