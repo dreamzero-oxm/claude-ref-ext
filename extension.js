@@ -6,6 +6,14 @@ const claudeTerminals = new Set();
 // 终端不支持 shell 集成、无法检测时只提示一次，避免反复打扰。
 let degradeWarned = false;
 
+// Stop hook 写入的信号文件（相对工作区根目录）。Claude Code 每轮回复结束会触发
+// Stop hook，由 hook 更新此文件；扩展通过 FileSystemWatcher 监听其变化来弹出
+// 「本轮回复完成」提示。终端 API 无法感知交互式 claude 会话内部的单轮结束，
+// 故借道 Claude Code 自身的 hook 机制桥接。
+const STOP_SIGNAL_RELATIVE = '.claude/.claude-ref-stop';
+// 去抖：文件的 create + change 可能连续触发，避免一轮结束弹两次。
+let lastTurnEndNotify = 0;
+
 /**
  * 判断给定命令行是否在启动 Claude Code（按配置的正则匹配，默认匹配 "claude"）。
  * 用户的命令可能不叫 claude（如 claude-other），故通过配置项自定义。
@@ -269,7 +277,22 @@ function activate(context) {
   // 供「仅在 Claude Code 运行时发送」(requireClaudeRunning) 的门禁判断使用。
   context.subscriptions.push(...registerShellExecutionTracking());
 
-  context.subscriptions.push(sendSelection, sendFile, lensRegistration, selectionWatcher);
+  // 监听 Stop hook 信号文件，在 Claude Code 每轮回复结束时弹提示（按配置开关）。
+  context.subscriptions.push(...registerTurnEndNotifier());
+
+  // 一键把 Stop hook 写入 .claude/settings.json，省去手动配置。
+  const installHook = vscode.commands.registerCommand(
+    'claudeRef.installStopHook',
+    installStopHook
+  );
+
+  // 移除本扩展写入的 Stop hook。
+  const uninstallHook = vscode.commands.registerCommand(
+    'claudeRef.uninstallStopHook',
+    uninstallStopHook
+  );
+
+  context.subscriptions.push(sendSelection, sendFile, lensRegistration, selectionWatcher, installHook, uninstallHook);
 }
 
 /**
@@ -311,6 +334,202 @@ function registerShellExecutionTracking() {
   );
 
   return disposables;
+}
+
+/**
+ * 监听 Stop hook 写入的信号文件，在 Claude Code 每轮回复结束时弹出提示。
+ * 信号文件位于每个工作区根的 .claude/.claude-ref-stop；Stop hook 触发时更新它，
+ * FileSystemWatcher 捕获 create/change 事件后弹 showInformationMessage。
+ *
+ * 仅在配置项 claudeRef.notifyOnTurnEnd 开启时生效。返回需要 dispose 的资源。
+ * @returns {vscode.Disposable[]}
+ */
+function registerTurnEndNotifier() {
+  const onTurnEnd = () => {
+    if (!vscode.workspace.getConfiguration('claudeRef').get('notifyOnTurnEnd', false)) {
+      return;
+    }
+    // 去抖：同一轮的 create+change 在很短时间内连续到达时只提示一次
+    // （注意：扩展宿主环境无 Date.now 限制，这里可正常使用）
+    const now = Date.now();
+    if (now - lastTurnEndNotify < 800) {
+      return;
+    }
+    lastTurnEndNotify = now;
+    const message = vscode.workspace
+      .getConfiguration('claudeRef')
+      .get('turnEndMessage', '✅ Claude Code 本轮回复已完成');
+    vscode.window.showInformationMessage(message);
+  };
+
+  // 为信号文件创建 watcher（glob 覆盖所有工作区根）。文件可能尚不存在，
+  // create 与 change 都要监听。
+  const watcher = vscode.workspace.createFileSystemWatcher(`**/${STOP_SIGNAL_RELATIVE}`);
+  watcher.onDidCreate(onTurnEnd);
+  watcher.onDidChange(onTurnEnd);
+
+  return [watcher];
+}
+
+/**
+ * 判断一个 Stop hook 条目是否由本扩展写入：按信号文件名 .claude-ref-stop 识别，
+ * 以便同时匹配新（node）与旧（printf）等各种命令变体，install/uninstall 共用。
+ * @param {any} entry .claude/settings.json 中 hooks.Stop 的一个元素
+ * @returns {boolean}
+ */
+function isOurStopHookEntry(entry) {
+  return !!(
+    entry &&
+    Array.isArray(entry.hooks) &&
+    entry.hooks.some(
+      (h) => h && typeof h.command === 'string' && h.command.includes('.claude-ref-stop')
+    )
+  );
+}
+
+/**
+ * 把 Stop hook 幂等地合并写入工作区的 .claude/settings.json。
+ * hook 命令仅向信号文件追加一个时间戳以触发文件变化（不读取、不外发任何内容）。
+ * 已存在等价 hook 时不重复添加。
+ */
+async function installStopHook() {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    vscode.window.showWarningMessage('Claude Ref: 没有打开的工作区，无法安装 Stop hook。');
+    return;
+  }
+  // 多工作区时让用户选一个根目录
+  let folder = folders[0];
+  if (folders.length > 1) {
+    const picked = await vscode.window.showWorkspaceFolderPick({
+      placeHolder: '选择要安装 Stop hook 的工作区',
+    });
+    if (!picked) {
+      return;
+    }
+    folder = picked;
+  }
+
+  const claudeDir = vscode.Uri.joinPath(folder.uri, '.claude');
+  const settingsUri = vscode.Uri.joinPath(claudeDir, 'settings.json');
+
+  // hook 命令：向信号文件写入当前时间戳，触发 FileSystemWatcher 的 change 事件。
+  // 用 node -e 实现跨平台一致（Windows/macOS/Linux 行为相同）——运行 claude 的
+  // 环境必然装有 node，故不依赖 date/printf 或 shell 重定向。命令简单、覆盖写、
+  // 不读取也不外发任何对话内容。
+  const hookCommand =
+    "node -e \"require('fs').writeFileSync('.claude/.claude-ref-stop', String(Date.now()))\"";
+
+  // 读取已有 settings.json（可能不存在或为空）
+  let settings = {};
+  try {
+    const raw = await vscode.workspace.fs.readFile(settingsUri);
+    const text = Buffer.from(raw).toString('utf8').trim();
+    if (text) {
+      settings = JSON.parse(text);
+    }
+  } catch (e) {
+    // 文件不存在等情况，按空配置处理
+    settings = {};
+  }
+
+  // 合并 hooks.Stop 数组（Claude Code hooks 结构）。已存在等价命令则不重复添加。
+  if (!settings.hooks || typeof settings.hooks !== 'object') {
+    settings.hooks = {};
+  }
+  if (!Array.isArray(settings.hooks.Stop)) {
+    settings.hooks.Stop = [];
+  }
+  const already = settings.hooks.Stop.some(isOurStopHookEntry);
+  if (already) {
+    vscode.window.showInformationMessage('Claude Ref: Stop hook 已安装，无需重复。');
+    return;
+  }
+  settings.hooks.Stop.push({
+    hooks: [{ type: 'command', command: hookCommand }],
+  });
+
+  // 确保 .claude 目录存在并写回（2 空格缩进，保持与常见 JSON 风格一致）
+  try {
+    await vscode.workspace.fs.createDirectory(claudeDir);
+    const out = Buffer.from(JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    await vscode.workspace.fs.writeFile(settingsUri, out);
+    vscode.window.showInformationMessage(
+      'Claude Ref: 已写入 Stop hook 到 .claude/settings.json。请重启或重新加载正在运行的 claude 会话后生效。'
+    );
+  } catch (e) {
+    vscode.window.showErrorMessage(`Claude Ref: 写入 Stop hook 失败：${e.message}`);
+  }
+}
+
+/**
+ * 从工作区的 .claude/settings.json 移除本扩展写入的 Stop hook（含旧的 printf 变体）。
+ * 移除后若 hooks.Stop / hooks 变空则一并清掉，保持配置整洁；不动其他配置。
+ */
+async function uninstallStopHook() {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    vscode.window.showWarningMessage('Claude Ref: 没有打开的工作区，无法移除 Stop hook。');
+    return;
+  }
+  // 多工作区时让用户选一个根目录
+  let folder = folders[0];
+  if (folders.length > 1) {
+    const picked = await vscode.window.showWorkspaceFolderPick({
+      placeHolder: '选择要移除 Stop hook 的工作区',
+    });
+    if (!picked) {
+      return;
+    }
+    folder = picked;
+  }
+
+  const settingsUri = vscode.Uri.joinPath(folder.uri, '.claude', 'settings.json');
+
+  // 读取已有 settings.json
+  let settings = {};
+  try {
+    const raw = await vscode.workspace.fs.readFile(settingsUri);
+    const text = Buffer.from(raw).toString('utf8').trim();
+    if (text) {
+      settings = JSON.parse(text);
+    }
+  } catch (e) {
+    vscode.window.showInformationMessage('Claude Ref: 未找到 .claude/settings.json，无需移除。');
+    return;
+  }
+
+  const stop = settings.hooks && settings.hooks.Stop;
+  if (!Array.isArray(stop) || stop.length === 0) {
+    vscode.window.showInformationMessage('Claude Ref: 未发现已安装的 Stop hook。');
+    return;
+  }
+
+  const kept = stop.filter((entry) => !isOurStopHookEntry(entry));
+  if (kept.length === stop.length) {
+    vscode.window.showInformationMessage('Claude Ref: 未发现本扩展写入的 Stop hook。');
+    return;
+  }
+
+  // 写回过滤后的数组；若变空则连同空的 Stop / hooks 一并清理
+  if (kept.length > 0) {
+    settings.hooks.Stop = kept;
+  } else {
+    delete settings.hooks.Stop;
+    if (Object.keys(settings.hooks).length === 0) {
+      delete settings.hooks;
+    }
+  }
+
+  try {
+    const out = Buffer.from(JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    await vscode.workspace.fs.writeFile(settingsUri, out);
+    vscode.window.showInformationMessage(
+      'Claude Ref: 已从 .claude/settings.json 移除 Stop hook。请重启或重新加载正在运行的 claude 会话后生效。'
+    );
+  } catch (e) {
+    vscode.window.showErrorMessage(`Claude Ref: 移除 Stop hook 失败：${e.message}`);
+  }
 }
 
 function deactivate() {}

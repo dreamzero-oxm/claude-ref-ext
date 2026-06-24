@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",
@@ -44,6 +44,14 @@
       {
         "command": "claudeRef.sendFile",
         "title": "Claude Ref: 发送文件引用到终端"
+      },
+      {
+        "command": "claudeRef.installStopHook",
+        "title": "Claude Ref: 安装对话结束提示 Hook"
+      },
+      {
+        "command": "claudeRef.uninstallStopHook",
+        "title": "Claude Ref: 移除对话结束提示 Hook"
       }
     ],
     "keybindings": [
@@ -112,6 +120,16 @@
           "type": "string",
           "default": "claude",
           "description": "用于识别 Claude Code 的命令名（正则，不区分大小写）。命令不叫 claude 时（如 claude-other）按需修改，例如填写 'claude|claude-other' 以同时匹配两者。仅在开启 claudeRef.requireClaudeRunning 时生效。"
+        },
+        "claudeRef.notifyOnTurnEnd": {
+          "type": "boolean",
+          "default": false,
+          "description": "在 Claude Code 每轮对话回复结束时于 IDE 弹出提示。依赖 Claude Code 的 Stop hook：请先执行命令「Claude Ref: 安装对话结束提示 Hook」把 hook 写入 .claude/settings.json。"
+        },
+        "claudeRef.turnEndMessage": {
+          "type": "string",
+          "default": "✅ Claude Code 本轮回复已完成",
+          "description": "对话结束提示的文案。仅在开启 claudeRef.notifyOnTurnEnd 时生效。"
         }
       }
     }
