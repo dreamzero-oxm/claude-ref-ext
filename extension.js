@@ -1,6 +1,32 @@
 const vscode = require('vscode');
 const path = require('path');
 
+// 记录「当前正在运行 Claude Code」的终端集合，由 shell 集成事件维护。
+const claudeTerminals = new Set();
+// 终端不支持 shell 集成、无法检测时只提示一次，避免反复打扰。
+let degradeWarned = false;
+
+/**
+ * 判断给定命令行是否在启动 Claude Code（按配置的正则匹配，默认匹配 "claude"）。
+ * 用户的命令可能不叫 claude（如 claude-other），故通过配置项自定义。
+ * @param {string} commandLine
+ * @returns {boolean}
+ */
+function matchesClaudeCommand(commandLine) {
+  const pattern = vscode.workspace
+    .getConfiguration('claudeRef')
+    .get('claudeCommandPattern', 'claude');
+  if (!pattern || !commandLine) {
+    return false;
+  }
+  try {
+    return new RegExp(pattern, 'i').test(commandLine);
+  } catch (e) {
+    // 配置的不是合法正则时，退化为不区分大小写的子串匹配
+    return commandLine.toLowerCase().includes(pattern.toLowerCase());
+  }
+}
+
 /**
  * 把一个文件 URI 转成引用里使用的路径（统一正斜杠，按配置决定相对 / 绝对）。
  * @param {vscode.Uri} uri
@@ -68,6 +94,7 @@ function sendRefs(refs) {
   const submitOnSend = cfg.get('submitOnSend', false);
   const terminalName = cfg.get('terminalName', '');
   const focusTerminalOnSend = cfg.get('focusTerminalOnSend', false);
+  const requireClaudeRunning = cfg.get('requireClaudeRunning', false);
 
   const payload = unique.join(' ') + ' ';
 
@@ -77,6 +104,33 @@ function sendRefs(refs) {
     terminal = vscode.window.terminals.find((t) => t.name === terminalName);
   }
   terminal = terminal || vscode.window.activeTerminal;
+
+  // 开启「仅在 Claude Code 运行时发送」时，发送前确认目标终端确实在跑 claude，
+  // 避免把 @path 引用漏打进一个普通 shell（在那里没有意义）。
+  if (requireClaudeRunning) {
+    // 没有任何现成终端就意味着 claude 肯定没在跑，直接拦截
+    if (!terminal) {
+      vscode.window.showWarningMessage(
+        'Claude Ref: 未检测到正在运行 Claude Code 的终端，已取消发送。'
+      );
+      return;
+    }
+    // shell 集成不可用时无法可靠判断，降级为照常发送，仅首次提示
+    if (typeof vscode.window.onDidStartTerminalShellExecution !== 'function') {
+      if (!degradeWarned) {
+        degradeWarned = true;
+        vscode.window.showInformationMessage(
+          'Claude Ref: 当前 VSCode 不支持终端 Shell 集成，无法检测 Claude Code 是否运行，已照常发送。'
+        );
+      }
+    } else if (!claudeTerminals.has(terminal)) {
+      vscode.window.showWarningMessage(
+        'Claude Ref: 目标终端未在运行 Claude Code，已取消发送。'
+      );
+      return;
+    }
+  }
+
   if (!terminal) {
     terminal = vscode.window.createTerminal(terminalName || 'claude');
   }
@@ -210,7 +264,53 @@ function activate(context) {
     lensProvider.refresh();
   });
 
+  // 通过 shell 集成事件追踪每个终端是否正在运行 Claude Code：
+  // 命令开始执行且命令行匹配（默认 claude，可配置）时标记该终端，结束时清除。
+  // 供「仅在 Claude Code 运行时发送」(requireClaudeRunning) 的门禁判断使用。
+  context.subscriptions.push(...registerShellExecutionTracking());
+
   context.subscriptions.push(sendSelection, sendFile, lensRegistration, selectionWatcher);
+}
+
+/**
+ * 注册 shell 集成事件监听，维护 claudeTerminals 集合。
+ * 旧版本 VSCode 没有这些 API 时返回空数组（功能自动降级）。
+ * @returns {vscode.Disposable[]}
+ */
+function registerShellExecutionTracking() {
+  const disposables = [];
+
+  if (typeof vscode.window.onDidStartTerminalShellExecution === 'function') {
+    disposables.push(
+      vscode.window.onDidStartTerminalShellExecution((e) => {
+        const commandLine = e.execution && e.execution.commandLine && e.execution.commandLine.value;
+        if (matchesClaudeCommand(commandLine || '')) {
+          claudeTerminals.add(e.terminal);
+        }
+      })
+    );
+  }
+
+  if (typeof vscode.window.onDidEndTerminalShellExecution === 'function') {
+    disposables.push(
+      vscode.window.onDidEndTerminalShellExecution((e) => {
+        const commandLine = e.execution && e.execution.commandLine && e.execution.commandLine.value;
+        // claude 进程退出（其启动命令执行结束）时，取消该终端的标记
+        if (matchesClaudeCommand(commandLine || '')) {
+          claudeTerminals.delete(e.terminal);
+        }
+      })
+    );
+  }
+
+  // 终端关闭时清理，避免悬挂引用
+  disposables.push(
+    vscode.window.onDidCloseTerminal((terminal) => {
+      claudeTerminals.delete(terminal);
+    })
+  );
+
+  return disposables;
 }
 
 function deactivate() {}

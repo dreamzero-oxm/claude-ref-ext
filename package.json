@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",
@@ -102,6 +102,16 @@
           "type": "string",
           "default": "",
           "description": "目标终端名称。留空则使用当前活动终端；填写后会优先查找同名终端，找不到则新建。"
+        },
+        "claudeRef.requireClaudeRunning": {
+          "type": "boolean",
+          "default": false,
+          "description": "仅在目标终端正在运行 Claude Code 时才发送引用。开启后，若检测到目标终端没有在跑 claude，则取消发送并提示，避免把 @path 引用误打进普通 shell。依赖 VSCode 终端 Shell 集成；不支持时会降级为照常发送。"
+        },
+        "claudeRef.claudeCommandPattern": {
+          "type": "string",
+          "default": "claude",
+          "description": "用于识别 Claude Code 的命令名（正则，不区分大小写）。命令不叫 claude 时（如 claude-other）按需修改，例如填写 'claude|claude-other' 以同时匹配两者。仅在开启 claudeRef.requireClaudeRunning 时生效。"
         }
       }
     }

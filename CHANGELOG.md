@@ -5,6 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-06-24
+
+### 新增
+
+- 配置项 `claudeRef.requireClaudeRunning`：仅在目标终端正在运行 Claude Code 时才发送引用（默认关闭）。开启后若检测到目标终端没有在跑 claude，则取消发送并提示，避免把 `@path` 引用误打进普通 shell。基于 VSCode 终端 Shell 集成的命令执行事件追踪实现；旧版本不支持该 API 时自动降级为照常发送（仅首次提示）
+- 配置项 `claudeRef.claudeCommandPattern`：用于识别 Claude Code 的命令名（正则，不区分大小写，默认 `claude`）。命令不叫 claude（如 claude-other）时可自定义，例如填写 `claude|claude-other` 同时匹配两者；仅在开启 `claudeRef.requireClaudeRunning` 时生效
+
 ## [1.1.0] - 2026-06-24
 
 ### 新增
