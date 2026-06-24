@@ -5,6 +5,12 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-06-24
+
+### 新增
+
+- 配置项 `claudeRef.focusTerminalOnSend`：发送引用后是否把焦点切换到终端（默认关闭）。开启后点击 CodeLens 气泡或使用快捷键发送引用时，焦点会直接落到终端；与是否自动回车（`claudeRef.submitOnSend`）相互独立，仅聚焦不会触发提交
+
 ## [1.0.0] - 2026-06-23
 
 ### 新增

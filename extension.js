@@ -67,6 +67,7 @@ function sendRefs(refs) {
   const cfg = vscode.workspace.getConfiguration('claudeRef');
   const submitOnSend = cfg.get('submitOnSend', false);
   const terminalName = cfg.get('terminalName', '');
+  const focusTerminalOnSend = cfg.get('focusTerminalOnSend', false);
 
   const payload = unique.join(' ') + ' ';
 
@@ -80,7 +81,9 @@ function sendRefs(refs) {
     terminal = vscode.window.createTerminal(terminalName || 'claude');
   }
 
-  terminal.show(true);
+  // show 的参数为 preserveFocus：true 表示保留当前焦点（停留在编辑器），
+  // false 则把焦点切到终端。按配置决定发送后是否抢占焦点。
+  terminal.show(!focusTerminalOnSend);
   // 第二个参数为是否追加换行：true 表示发送后直接回车提交
   terminal.sendText(payload, submitOnSend);
 }
