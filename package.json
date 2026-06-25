@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",
@@ -46,12 +46,32 @@
         "title": "Claude Ref: 发送文件引用到终端"
       },
       {
+        "command": "claudeRef.sendDiagnostics",
+        "title": "Claude Ref: 发送诊断/报错到终端"
+      },
+      {
+        "command": "claudeRef.sendSymbol",
+        "title": "Claude Ref: 发送光标所在符号引用到终端"
+      },
+      {
+        "command": "claudeRef.sendGitChanges",
+        "title": "Claude Ref: 发送 Git 变更引用到终端"
+      },
+      {
+        "command": "claudeRef.sendWithTemplate",
+        "title": "Claude Ref: 选模板发送引用到终端"
+      },
+      {
         "command": "claudeRef.installStopHook",
         "title": "Claude Ref: 安装对话结束提示 Hook"
       },
       {
         "command": "claudeRef.uninstallStopHook",
         "title": "Claude Ref: 移除对话结束提示 Hook"
+      },
+      {
+        "command": "claudeRef.focusClaudeTerminal",
+        "title": "Claude Ref: 聚焦正在运行的 Claude Code 终端"
       }
     ],
     "keybindings": [
@@ -74,12 +94,32 @@
           "command": "claudeRef.sendSelection",
           "group": "navigation@99",
           "when": "editorTextFocus"
+        },
+        {
+          "command": "claudeRef.sendDiagnostics",
+          "group": "navigation@98",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "claudeRef.sendSymbol",
+          "group": "navigation@96",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "claudeRef.sendWithTemplate",
+          "group": "navigation@97",
+          "when": "editorTextFocus && editorHasSelection"
         }
       ],
       "explorer/context": [
         {
           "command": "claudeRef.sendFile",
           "group": "navigation@99",
+          "when": "!explorerResourceIsFolder"
+        },
+        {
+          "command": "claudeRef.sendWithTemplate",
+          "group": "navigation@97",
           "when": "!explorerResourceIsFolder"
         }
       ]
@@ -121,6 +161,16 @@
           "default": "claude",
           "description": "用于识别 Claude Code 的命令名（正则，不区分大小写）。命令不叫 claude 时（如 claude-other）按需修改，例如填写 'claude|claude-other' 以同时匹配两者。仅在开启 claudeRef.requireClaudeRunning 时生效。"
         },
+        "claudeRef.promptForTerminalWhenMultiple": {
+          "type": "boolean",
+          "default": true,
+          "description": "检测到多个正在运行 Claude Code 的终端时，发送前弹出选择让你挑一个目标终端。关闭则不询问，自动选当前活动的 claude 终端（没有则取第一个）。仅在能检测到 claude 会话时生效（依赖 VSCode 终端 Shell 集成）；已通过 claudeRef.terminalName 指定固定终端时不询问。"
+        },
+        "claudeRef.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "在状态栏显示一个指示项，展示当前检测到的 Claude Code 会话数量；点击可聚焦（多个时选择）对应终端。开启「仅在 Claude Code 运行时发送」且无会话时，指示项会变为警告色提示发送将被拦截。依赖 VSCode 终端 Shell 集成；不支持时显示为「未知」。"
+        },
         "claudeRef.notifyOnTurnEnd": {
           "type": "boolean",
           "default": false,
@@ -130,6 +180,72 @@
           "type": "string",
           "default": "✅ Claude Code 本轮回复已完成",
           "description": "对话结束提示的文案。仅在开启 claudeRef.notifyOnTurnEnd 时生效。"
+        },
+        "claudeRef.notifyStyle": {
+          "type": "string",
+          "enum": [
+            "system",
+            "ide"
+          ],
+          "enumDescriptions": [
+            "系统级桌面通知（独立于 IDE 窗口，最小化或失焦时也能看到；macOS 用 osascript、Linux 用 notify-send、Windows 用 PowerShell Toast，命令缺失时自动降级为 IDE 提示）。",
+            "IDE 内部右下角提示（vscode.window.showInformationMessage）。"
+          ],
+          "default": "system",
+          "description": "对话结束提示的弹出方式。仅在开启 claudeRef.notifyOnTurnEnd 时生效。"
+        },
+        "claudeRef.gitChangesPrompt": {
+          "type": "string",
+          "editPresentation": "multilineText",
+          "default": "",
+          "description": "「发送 Git 变更引用」时使用的 prompt 模板。默认为空，即只发送文件引用本身。可写一套提示词并用占位符 {{refs}} 标记文件引用的注入位置，例如：「请 review 以下改动，重点看错误处理：{{refs}}」。模板中没有 {{refs}} 时，文件引用会追加到模板末尾。"
+        },
+        "claudeRef.gitIncludeUntracked": {
+          "type": "boolean",
+          "default": true,
+          "description": "「发送 Git 变更引用」时是否包含未跟踪（untracked）的新文件。关闭后只发送已跟踪文件的改动（已暂存 + 未暂存）。已删除的文件始终排除。"
+        },
+        "claudeRef.promptTemplates": {
+          "type": "array",
+          "default": [
+            {
+              "label": "解释",
+              "prompt": "请解释以下代码的作用与实现思路："
+            },
+            {
+              "label": "重构",
+              "prompt": "请重构以下代码，提升可读性与可维护性，保持行为不变："
+            },
+            {
+              "label": "写测试",
+              "prompt": "请为以下代码编写单元测试，覆盖主要分支与边界情况："
+            },
+            {
+              "label": "审查改动",
+              "prompt": "请审查以下改动，重点关注潜在 bug、错误处理与边界条件：\n{{refs}}\n并给出具体的修改建议。"
+            }
+          ],
+          "description": "提示词模板列表，供「Claude Ref: 选模板发送引用到终端」选择。默认预置「解释」「重构」「写测试」「审查改动」，可自行增删改。每项的 prompt 会拼在引用前面；若 prompt 中含占位符 {{refs}}，则引用注入到该位置。",
+          "items": {
+            "type": "object",
+            "required": [
+              "label"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "模板名称，显示在 quick-pick 列表中。"
+              },
+              "prompt": {
+                "type": "string",
+                "description": "提示词内容，拼在引用前面；含 {{refs}} 时把引用注入该位置。留空则只发送引用。"
+              },
+              "detail": {
+                "type": "string",
+                "description": "可选。quick-pick 中显示的副标题说明；省略时自动用 prompt 的摘要。"
+              }
+            }
+          }
         }
       }
     }
