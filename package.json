@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.5.0",
+  "version": "1.6.5",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",
@@ -72,6 +72,46 @@
       {
         "command": "claudeRef.focusClaudeTerminal",
         "title": "Claude Ref: 聚焦正在运行的 Claude Code 终端"
+      },
+      {
+        "command": "claudeRef.installReviewHooks",
+        "title": "Claude Ref: 安装代码 Review Hook"
+      },
+      {
+        "command": "claudeRef.uninstallReviewHooks",
+        "title": "Claude Ref: 移除代码 Review Hook"
+      },
+      {
+        "command": "claudeRef.startReview",
+        "title": "Claude Ref: 开始 Review 本轮改动"
+      },
+      {
+        "command": "claudeRef.acceptHunk",
+        "title": "Claude Ref: 接受当前改动块"
+      },
+      {
+        "command": "claudeRef.rejectHunk",
+        "title": "Claude Ref: 拒绝当前改动块（保留原代码）"
+      },
+      {
+        "command": "claudeRef.resetHunk",
+        "title": "Claude Ref: 撤销当前改动块决策"
+      },
+      {
+        "command": "claudeRef.nextHunk",
+        "title": "Claude Ref: 跳到下一个改动块"
+      },
+      {
+        "command": "claudeRef.prevHunk",
+        "title": "Claude Ref: 跳到上一个改动块"
+      },
+      {
+        "command": "claudeRef.nextFile",
+        "title": "Claude Ref: Review 下一个文件"
+      },
+      {
+        "command": "claudeRef.prevFile",
+        "title": "Claude Ref: Review 上一个文件"
       }
     ],
     "keybindings": [
@@ -86,6 +126,31 @@
         "key": "ctrl+alt+k",
         "mac": "cmd+alt+k",
         "when": "filesExplorerFocus && !inputFocus"
+      },
+      {
+        "command": "claudeRef.acceptHunk",
+        "key": "alt+a",
+        "when": "claudeRef.reviewActive && editorTextFocus"
+      },
+      {
+        "command": "claudeRef.rejectHunk",
+        "key": "alt+d",
+        "when": "claudeRef.reviewActive && editorTextFocus"
+      },
+      {
+        "command": "claudeRef.resetHunk",
+        "key": "alt+z",
+        "when": "claudeRef.reviewActive && editorTextFocus"
+      },
+      {
+        "command": "claudeRef.nextHunk",
+        "key": "alt+down",
+        "when": "claudeRef.reviewActive && editorTextFocus"
+      },
+      {
+        "command": "claudeRef.prevHunk",
+        "key": "alt+up",
+        "when": "claudeRef.reviewActive && editorTextFocus"
       }
     ],
     "menus": {
@@ -246,6 +311,16 @@
               }
             }
           }
+        },
+        "claudeRef.reviewOnTurnEnd": {
+          "type": "boolean",
+          "default": false,
+          "description": "在 Claude Code 每轮回复结束后，自动对本轮改动的文件进入「逐块 Review」（红=改动前 / 绿=改动后，可逐块接受或拒绝）。依赖代码 Review Hook：请先执行命令「Claude Ref: 安装代码 Review Hook」。"
+        },
+        "claudeRef.reviewAutoSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Review 期间每次「接受/拒绝/撤销」后是否自动保存文件。关闭时文件保持未保存（dirty）状态，方便你用编辑器撤销；Review 结束时会统一保存。"
         }
       }
     }

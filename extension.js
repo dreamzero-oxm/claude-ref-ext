@@ -18,6 +18,34 @@ const STOP_SIGNAL_RELATIVE = '.claude/.claude-ref-stop';
 // 去抖：文件的 create + change 可能连续触发，避免一轮结束弹两次。
 let lastTurnEndNotify = 0;
 
+// ── Review（IDE 内逐块 review Claude 改动）相关常量 ────────────────────────────
+// Review 数据目录（工作区根下，相对路径）。PreToolUse hook 在每次编辑前把文件原文
+// 快照到这里作为「红色基准」，Stop hook 写 ready 信号触发扩展进入 review。
+const REVIEW_DIR_RELATIVE = '.claude/.claude-ref-review';
+// review hook 脚本文件名（安装时写入 .claude/ 下）。单脚本按 hook_event_name 分派：
+// PreToolUse → 抓基线快照；Stop → 写 ready 信号。
+const REVIEW_HOOK_RELATIVE = '.claude/claude-ref-review-hook.js';
+// settings.json 里识别「本扩展 review hook 条目」的命令特征串（install/uninstall 共用）。
+const REVIEW_HOOK_MARKER = 'claude-ref-review-hook';
+// Stop hook 写入的 ready 信号文件（相对工作区根）；扩展 watch 它进入 review。
+const REVIEW_READY_RELATIVE = REVIEW_DIR_RELATIVE + '/ready';
+// review ready 去抖（同 lastTurnEndNotify 模式）。
+let lastReviewReady = 0;
+
+// 扩展上下文（activate 时赋值），用于定位随扩展打包的 review-hook.js 模板。
+let extensionContext = null;
+// 当前进行中的 review 会话；null 表示未在 review。结构见 startReviewSession。
+let reviewSession = null;
+// 会话序号，递增——用作 baseline 虚拟文档 URI 的 query，避免跨会话同名文件命中旧缓存。
+let reviewSeq = 0;
+// baseline 虚拟文档表：baselineUri.toString() → 该 review 文件对象（左侧内容按其逐块状态动态重建）。
+const baselineDocs = new Map();
+// BaselineContentProvider 单例（activate 时赋值），决策后用它 fire(uri) 刷新左侧内容。
+let baselineProvider = null;
+// review 导航用的状态栏项（上/下一块、下一个文件、进度），仅 review 进行中显示。
+let reviewNavItems = null;
+
+
 /**
  * 判断给定命令行是否在启动 Claude Code（按配置的正则匹配，默认匹配 "claude"）。
  * 用户的命令可能不叫 claude（如 claude-other），故通过配置项自定义。
@@ -630,6 +658,9 @@ class DiagnosticRefActionProvider {
 DiagnosticRefActionProvider.providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
 
 function activate(context) {
+  // 保存上下文，供 review hook 脚本定位（copyReviewHookScript 用 extensionPath）。
+  extensionContext = context;
+
   // 编辑器中：选中代码 → @path#Lstart-end
   const sendSelection = vscode.commands.registerCommand('claudeRef.sendSelection', () => {
     const editor = vscode.window.activeTextEditor;
@@ -833,7 +864,60 @@ function activate(context) {
     uninstallStopHook
   );
 
-  context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, diagActionRegistration, installHook, uninstallHook, focusClaude);
+  // ── Review 子系统注册 ──────────────────────────────────────────────────
+  // 基线（diff 左侧）只读虚拟文档提供者；决策后 fire(uri) 刷新左侧使红绿消失。
+  baselineProvider = new BaselineContentProvider();
+  const baselineRegistration = vscode.workspace.registerTextDocumentContentProvider(
+    BASELINE_SCHEME,
+    baselineProvider
+  );
+  // 右侧（改后）文档上的逐块「接受/拒绝/撤销」CodeLens（若当前 VSCode 支持 diff 内渲染）。
+  reviewLensProvider = new ReviewHunkLensProvider();
+  const reviewLensRegistration = vscode.languages.registerCodeLensProvider(
+    { scheme: 'file' },
+    reviewLensProvider
+  );
+  // 同一 provider 也注册到基线虚拟文档 scheme，使 diff 左侧也可能渲染按钮。
+  const reviewLensRegistrationBaseline = vscode.languages.registerCodeLensProvider(
+    { scheme: BASELINE_SCHEME },
+    reviewLensProvider
+  );
+  // ready 信号 watcher：每轮结束自动进入 review（按 reviewOnTurnEnd 开关）。
+  context.subscriptions.push(...registerReviewReadyWatcher());
+  // review 导航状态栏（上/下一块、下一个文件、进度）。
+  context.subscriptions.push(...registerReviewStatusBar());
+
+  // review 命令：安装/卸载 hook、手动开始、逐块决策、导航。
+  const installReview = vscode.commands.registerCommand('claudeRef.installReviewHooks', installReviewHooks);
+  const uninstallReview = vscode.commands.registerCommand('claudeRef.uninstallReviewHooks', uninstallReviewHooks);
+  const startReview = vscode.commands.registerCommand('claudeRef.startReview', async () => {
+    if (reviewSession) {
+      await openReviewFile(reviewSession.index);
+      return;
+    }
+    const folder = (vscode.workspace.workspaceFolders || [])[0];
+    if (!folder) {
+      vscode.window.showWarningMessage('Claude Ref: 没有打开的工作区。');
+      return;
+    }
+    await startReviewSession(folder.uri);
+  });
+  const acceptHunk = vscode.commands.registerCommand('claudeRef.acceptHunk', (id) => applyDecision(id, 'accepted'));
+  const rejectHunk = vscode.commands.registerCommand('claudeRef.rejectHunk', (id) => applyDecision(id, 'rejected'));
+  const resetHunk = vscode.commands.registerCommand('claudeRef.resetHunk', (id) => applyDecision(id, 'pending'));
+  const nextHunk = vscode.commands.registerCommand('claudeRef.nextHunk', () => gotoHunk(1));
+  const prevHunk = vscode.commands.registerCommand('claudeRef.prevHunk', () => gotoHunk(-1));
+  const nextFileCmd = vscode.commands.registerCommand('claudeRef.nextFile', () => nextFile());
+  const prevFileCmd = vscode.commands.registerCommand('claudeRef.prevFile', () => prevFile());
+  // 光标在 review 文件里移动时同步「当前块」指示（状态栏文案随之更新）。
+  const reviewSelectionWatcher = vscode.window.onDidChangeTextEditorSelection((e) => {
+    if (!reviewSession) return;
+    const file = reviewSession.files[reviewSession.index];
+    if (!file || e.textEditor.document.uri.toString() !== file.uri.toString()) return;
+    updateReviewNav();
+  });
+
+  context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, diagActionRegistration, installHook, uninstallHook, focusClaude, baselineRegistration, reviewLensRegistration, reviewLensRegistrationBaseline, installReview, uninstallReview, startReview, acceptHunk, rejectHunk, resetHunk, nextHunk, prevHunk, nextFileCmd, prevFileCmd, reviewSelectionWatcher);
 }
 
 /**
@@ -1277,6 +1361,912 @@ async function uninstallStopHook() {
     );
   } catch (e) {
     vscode.window.showErrorMessage(`Claude Ref: 移除 Stop hook 失败：${e.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Review 子系统：IDE 内逐块 review Claude 改动（红=改动前基线 / 绿=改动后）
+// 整体方案见 .work/plan-inline-code-review.md。核心：用内置 diff 编辑器呈现
+// 「左=基线只读虚拟文档 / 右=磁盘真实文件」的红/绿，再用 CodeLens + 状态栏叠加
+// 逐块「接受/拒绝/撤销」与导航。所有真实文件内容由各 hunk 状态纯函数重建，
+// 彻底规避行号漂移。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 自定义 scheme：基线（改动前）只读虚拟文档，左侧红色那一栏的来源。
+const BASELINE_SCHEME = 'claude-ref-baseline';
+
+/**
+ * 把文本按行切分（保留「无尾随换行」的语义）。统一用 \n；\r 作为行尾的一部分保留，
+ * 以免 CRLF 文件在重建后被改写行尾。返回行数组（不含换行符）。
+ * @param {string} text
+ * @returns {string[]}
+ */
+function splitLines(text) {
+  // 以 \n 分割；每行末尾可能残留 \r（CRLF），保留它以维持原行尾风格。
+  return text.split('\n');
+}
+
+/**
+ * 经典 LCS 行级 diff（无第三方依赖）。返回对齐操作序列：
+ *   { type:'equal'|'delete'|'insert', a:string[], b:string[] }
+ * delete=仅在基线 a 中（被删/被改的旧行），insert=仅在改后 b 中（新增/改后的新行），
+ * equal=两侧相同的行。相邻 delete+insert 在 buildHunks 里合并成「替换型」hunk。
+ * @param {string[]} a 基线行
+ * @param {string[]} b 改后行
+ * @returns {Array<{type:string,a:string[],b:string[]}>}
+ */
+function diffLines(a, b) {
+  const n = a.length;
+  const m = b.length;
+  // LCS 长度表（(n+1)×(m+1)）。文件级体量可接受 O(n*m)。
+  const dp = [];
+  for (let i = 0; i <= n; i++) {
+    dp.push(new Array(m + 1).fill(0));
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (a[i] === b[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+  // 回溯生成操作序列
+  const ops = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      ops.push({ type: 'equal', a: [a[i]], b: [b[j]] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ type: 'delete', a: [a[i]], b: [] });
+      i++;
+    } else {
+      ops.push({ type: 'insert', a: [], b: [b[j]] });
+      j++;
+    }
+  }
+  while (i < n) {
+    ops.push({ type: 'delete', a: [a[i]], b: [] });
+    i++;
+  }
+  while (j < m) {
+    ops.push({ type: 'insert', a: [], b: [b[j]] });
+    j++;
+  }
+  return ops;
+}
+
+/**
+ * 把 diffLines 的操作序列归并成「段」：连续的 equal 合一段；连续的 delete/insert
+ * （任意交错）合并成一个「改动块」段。返回有序段数组：
+ *   { changed:false, lines:string[] }                     不变段（原样输出）
+ *   { changed:true, original:string[], modified:string[] } 改动段（red=original / green=modified）
+ * @param {Array<{type:string,a:string[],b:string[]}>} ops
+ * @returns {Array<object>}
+ */
+function mergeSegments(ops) {
+  const segs = [];
+  let cur = null;
+  for (const op of ops) {
+    if (op.type === 'equal') {
+      if (!cur || cur.changed) {
+        cur = { changed: false, lines: [] };
+        segs.push(cur);
+      }
+      cur.lines.push(op.a[0]);
+    } else {
+      if (!cur || !cur.changed) {
+        cur = { changed: true, original: [], modified: [] };
+        segs.push(cur);
+      }
+      if (op.type === 'delete') cur.original.push(op.a[0]);
+      else cur.modified.push(op.b[0]);
+    }
+  }
+  return segs;
+}
+
+/**
+ * 由（基线文本, 改后文本）构建固定的 hunk 列表与不变段骨架。
+ * hunk: { id, original:string[], modified:string[], status:'pending'|'accepted'|'rejected' }
+ * 骨架 segments 保留顺序，hunk 段引用同一对象（便于按状态重建）。
+ * @param {string} baselineText
+ * @param {string} modifiedText
+ * @returns {{segments:Array<object>, hunks:Array<object>}}
+ */
+function buildHunks(baselineText, modifiedText) {
+  const ops = diffLines(splitLines(baselineText), splitLines(modifiedText));
+  const segments = mergeSegments(ops);
+  const hunks = [];
+  let id = 0;
+  for (const seg of segments) {
+    if (seg.changed) {
+      const hunk = {
+        id: id++,
+        original: seg.original,
+        modified: seg.modified,
+        status: 'pending',
+      };
+      seg.hunk = hunk;
+      hunks.push(hunk);
+    }
+  }
+  return { segments, hunks };
+}
+
+/**
+ * 按各 hunk 当前状态把文件重建为文本，并记录每个 hunk 在重建结果中的行范围。
+ *   accepted | pending → 输出 modified（绿，Claude 改后）
+ *   rejected           → 输出 original（红，改动前原代码）
+ * 返回 { text, ranges: Map<hunkId,[startLine,endLineExclusive)> }（行号从 0 起）。
+ * @param {{segments:Array<object>}} file
+ * @returns {{text:string, ranges:Map<number,number[]>}}
+ */
+function reconstruct(file) {
+  const out = [];
+  const ranges = new Map();
+  for (const seg of file.segments) {
+    if (!seg.changed) {
+      for (const line of seg.lines) out.push(line);
+      continue;
+    }
+    const start = out.length;
+    const chosen = seg.hunk.status === 'rejected' ? seg.hunk.original : seg.hunk.modified;
+    for (const line of chosen) out.push(line);
+    ranges.set(seg.hunk.id, [start, out.length]);
+  }
+  return { text: out.join('\n'), ranges };
+}
+
+/**
+ * 重建 diff「左侧」（基线虚拟文档）文本。关键在于让已决策的块左右两侧一致，从而
+ * 不再显示红/绿背景：
+ *   pending  → original（与右侧 modified 不同 → 显示红/绿）
+ *   accepted → modified（与右侧 modified 相同 → 无颜色）
+ *   rejected → original（与右侧 original 相同 → 无颜色）
+ * @param {{segments:Array<object>}} file
+ * @returns {string}
+ */
+function reconstructLeft(file) {
+  const out = [];
+  for (const seg of file.segments) {
+    if (!seg.changed) {
+      for (const line of seg.lines) out.push(line);
+      continue;
+    }
+    const chosen = seg.hunk.status === 'accepted' ? seg.hunk.modified : seg.hunk.original;
+    for (const line of chosen) out.push(line);
+  }
+  return out.join('\n');
+}
+
+/**
+ * 基线（diff 左侧）只读虚拟文档提供者。内容按对应文件的逐块状态「动态」重建
+ * （见 reconstructLeft）；状态变化时由 fire(uri) 触发 VSCode 重新拉取内容，
+ * 使已接受/拒绝的块左右一致、红绿背景消失。
+ * baselineDocs: baselineUri.toString() → 该 review 文件对象。
+ * @implements {vscode.TextDocumentContentProvider}
+ */
+class BaselineContentProvider {
+  constructor() {
+    this._onDidChange = new vscode.EventEmitter();
+    this.onDidChange = this._onDidChange.event;
+  }
+  fire(uri) {
+    this._onDidChange.fire(uri);
+  }
+  provideTextDocumentContent(uri) {
+    const file = baselineDocs.get(uri.toString());
+    return file ? reconstructLeft(file) : '';
+  }
+}
+
+/**
+ * review 期间，在右侧（改后）真实文件上为每个 hunk 起始行提供「接受/拒绝/撤销」CodeLens。
+ * 仅对当前 review 文件生效；状态变化时由 refresh() 触发重算。
+ * @implements {vscode.CodeLensProvider}
+ */
+class ReviewHunkLensProvider {
+  constructor() {
+    this._onDidChange = new vscode.EventEmitter();
+    this.onDidChangeCodeLenses = this._onDidChange.event;
+  }
+  refresh() {
+    this._onDidChange.fire();
+  }
+  provideCodeLenses(document) {
+    if (!reviewSession) return [];
+    const file = reviewSession.files[reviewSession.index];
+    if (!file) return [];
+    // 同时服务 diff 右侧（真实文件）与左侧（基线虚拟文档）——哪一侧能渲染 CodeLens
+    // 就在哪一侧显示按钮。两侧的块行范围都用 reconstruct（右侧重建）的 ranges 近似定位。
+    const docStr = document.uri.toString();
+    const isRight = docStr === file.uri.toString();
+    const isLeft = docStr === file.baselineUri.toString();
+    if (!isRight && !isLeft) return [];
+
+    const { ranges } = reconstruct(file);
+    const lenses = [];
+    for (const hunk of file.hunks) {
+      const range = ranges.get(hunk.id);
+      if (!range) continue;
+      const line = Math.min(range[0], Math.max(0, document.lineCount - 1));
+      const lensRange = new vscode.Range(line, 0, line, 0);
+      if (hunk.status === 'pending') {
+        lenses.push(
+          new vscode.CodeLens(lensRange, { title: '$(check) 接受', command: 'claudeRef.acceptHunk', arguments: [hunk.id] }),
+          new vscode.CodeLens(lensRange, { title: '$(x) 拒绝', command: 'claudeRef.rejectHunk', arguments: [hunk.id] })
+        );
+      } else if (hunk.status === 'accepted') {
+        lenses.push(
+          new vscode.CodeLens(lensRange, { title: '✅ 已接受', command: 'claudeRef.nextHunk' }),
+          new vscode.CodeLens(lensRange, { title: '$(discard) 撤销', command: 'claudeRef.resetHunk', arguments: [hunk.id] })
+        );
+      } else {
+        lenses.push(
+          new vscode.CodeLens(lensRange, { title: '❌ 已拒绝（保留原代码）', command: 'claudeRef.nextHunk' }),
+          new vscode.CodeLens(lensRange, { title: '$(discard) 撤销', command: 'claudeRef.resetHunk', arguments: [hunk.id] })
+        );
+      }
+    }
+    return lenses;
+  }
+}
+
+// review CodeLens provider 单例（activate 注册，状态变化时 refresh）。
+let reviewLensProvider = null;
+
+/**
+ * 把当前会话各文件的逐块状态持久化到 <reviewDir>/state.json，使重开 review 能续上。
+ * 结构：{ files: { "<relpath>": { "<hunkId>": "accepted|rejected|pending", ... }, ... } }
+ */
+async function writeReviewState() {
+  if (!reviewSession || !reviewSession.reviewDirUri) return;
+  const state = { files: {} };
+  for (const f of reviewSession.files) {
+    const m = {};
+    for (const h of f.hunks) m[h.id] = h.status;
+    state.files[f.path] = m;
+  }
+  try {
+    const uri = vscode.Uri.joinPath(reviewSession.reviewDirUri, 'state.json');
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(state, null, 2), 'utf8'));
+  } catch (e) { /* 持久化失败不影响交互 */ }
+}
+
+/**
+ * 读取 <reviewDir>/state.json（不存在/损坏时返回 null）。
+ * @param {vscode.Uri} reviewDirUri
+ */
+async function readReviewState(reviewDirUri) {
+  try {
+    const uri = vscode.Uri.joinPath(reviewDirUri, 'state.json');
+    const raw = await vscode.workspace.fs.readFile(uri);
+    const parsed = JSON.parse(Buffer.from(raw).toString('utf8'));
+    return parsed && parsed.files ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 彻底删除本轮 review 记录目录（manifest/baseline/state/ready/.active），
+ * 使「完成审查」后无法再被「开始 review」重新打开。
+ * @param {vscode.Uri} reviewDirUri
+ */
+async function clearReviewRecord(reviewDirUri) {
+  try {
+    await vscode.workspace.fs.delete(reviewDirUri, { recursive: true, useTrash: false });
+  } catch (e) { /* 不存在则忽略 */ }
+}
+
+/**
+ * 从 manifest + baseline 快照构建并启动一次 review 会话，打开首个有差异的文件。
+ * @param {vscode.Uri} folderUri 工作区根
+ */
+async function startReviewSession(folderUri) {
+  const reviewDirUri = vscode.Uri.joinPath(folderUri, REVIEW_DIR_RELATIVE);
+  const manifestUri = vscode.Uri.joinPath(reviewDirUri, 'manifest.json');
+
+  let manifest;
+  try {
+    const raw = await vscode.workspace.fs.readFile(manifestUri);
+    manifest = JSON.parse(Buffer.from(raw).toString('utf8'));
+  } catch (e) {
+    vscode.window.showInformationMessage('Claude Ref: 未找到本轮改动清单，无法进入 review。');
+    return;
+  }
+  if (!manifest || !Array.isArray(manifest.files) || manifest.files.length === 0) {
+    vscode.window.showInformationMessage('Claude Ref: 本轮没有可 review 的文件改动。');
+    return;
+  }
+
+  reviewSeq++;
+  const savedState = await readReviewState(reviewDirUri);
+  const files = [];
+  for (const entry of manifest.files) {
+    if (!entry || !entry.path) continue;
+    const fileUri = vscode.Uri.joinPath(folderUri, entry.path);
+
+    // 基线内容（改动前）
+    let baselineText = '';
+    try {
+      const snapUri = vscode.Uri.joinPath(reviewDirUri, 'baseline', entry.baseline);
+      baselineText = Buffer.from(await vscode.workspace.fs.readFile(snapUri)).toString('utf8');
+    } catch (e) {
+      baselineText = '';
+    }
+    // 改后内容（当前磁盘）
+    let modifiedText = '';
+    try {
+      modifiedText = Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString('utf8');
+    } catch (e) {
+      // 文件已被删除等：跳过
+      continue;
+    }
+
+    const { segments, hunks } = buildHunks(baselineText, modifiedText);
+    if (hunks.length === 0) continue;
+
+    // 续上一次的逐块状态（如有），让重开 review 从上次进度继续。
+    const saved = savedState && savedState.files && savedState.files[entry.path];
+    if (saved) {
+      for (const h of hunks) {
+        if (saved[h.id] === 'accepted' || saved[h.id] === 'rejected' || saved[h.id] === 'pending') {
+          h.status = saved[h.id];
+        }
+      }
+    }
+
+    const baselineUri = vscode.Uri.parse(
+      `${BASELINE_SCHEME}:/${entry.path}?seq=${reviewSeq}`
+    );
+
+    const fileObj = {
+      path: entry.path,
+      uri: fileUri,
+      baselineUri,
+      baselineText,
+      segments,
+      hunks,
+    };
+    baselineDocs.set(baselineUri.toString(), fileObj);
+    files.push(fileObj);
+  }
+
+  if (files.length === 0) {
+    vscode.window.showInformationMessage('Claude Ref: 改动文件与基线一致，无需 review。');
+    return;
+  }
+
+  reviewSession = { files, index: 0, reviewDirUri };
+  vscode.commands.executeCommand('setContext', 'claudeRef.reviewActive', true);
+  await openReviewFile(0);
+}
+
+/**
+ * 打开 review 列表中第 i 个文件的 diff 视图（左基线/右真实文件），跳到首个 hunk。
+ * @param {number} i
+ */
+async function openReviewFile(i) {
+  if (!reviewSession) return;
+  reviewSession.index = i;
+  const file = reviewSession.files[i];
+  const title = `Review: ${file.path} (${i + 1}/${reviewSession.files.length})`;
+  await vscode.commands.executeCommand('vscode.diff', file.baselineUri, file.uri, title, {
+    preview: false,
+  });
+  if (reviewLensProvider) reviewLensProvider.refresh();
+  updateReviewNav();
+  // 跳到首个 hunk
+  gotoHunkIndex(0);
+}
+
+/**
+ * 改某 hunk 状态后：重建真实文件文本并写盘（WorkspaceEdit 全量覆盖），刷新 CodeLens 与导航。
+ * @param {object} file
+ */
+async function rebuildFile(file) {
+  const { text } = reconstruct(file);
+  const doc = await vscode.workspace.openTextDocument(file.uri);
+  const full = new vscode.Range(
+    new vscode.Position(0, 0),
+    doc.lineAt(doc.lineCount - 1).range.end
+  );
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(file.uri, full, text);
+  await vscode.workspace.applyEdit(edit);
+
+  if (vscode.workspace.getConfiguration('claudeRef').get('reviewAutoSave', false)) {
+    try {
+      await doc.save();
+    } catch (e) { /* ignore */ }
+  }
+  // 刷新 diff 左侧虚拟文档：已决策的块左右两侧一致 → 红绿背景消失。
+  if (baselineProvider) baselineProvider.fire(file.baselineUri);
+  if (reviewLensProvider) reviewLensProvider.refresh();
+  updateReviewNav();
+  // 把逐块状态持久化，重开 review 可续上。
+  await writeReviewState();
+}
+
+/**
+ * 取「当前块」：优先用导航记录的 file._cursor，其次回退到光标所在块。
+ * 状态栏按钮与无参快捷键都以此为作用对象——比单纯靠光标位置可靠（光标可能落在
+ * diff 左侧红色基线栏，那一侧 uri 不是真实文件，按光标反查会落空）。
+ * @returns {object|null}
+ */
+function currentHunk() {
+  if (!reviewSession) return null;
+  const file = reviewSession.files[reviewSession.index];
+  if (!file || file.hunks.length === 0) return null;
+  // 光标确实落在某个块内（右侧真实文件）时，以光标为准并同步 _cursor。
+  const byCursor = hunkAtCursor();
+  if (byCursor) {
+    const i = file.hunks.indexOf(byCursor);
+    if (i >= 0) file._cursor = i;
+    return byCursor;
+  }
+  const idx = typeof file._cursor === 'number' ? file._cursor : 0;
+  return file.hunks[Math.max(0, Math.min(idx, file.hunks.length - 1))];
+}
+
+/**
+ * 命中当前光标所在的 hunk（供 currentHunk 回退使用）。返回 hunk 或 null。
+ */
+function hunkAtCursor() {
+  if (!reviewSession) return null;
+  const file = reviewSession.files[reviewSession.index];
+  const editor = vscode.window.activeTextEditor;
+  if (!file || !editor || editor.document.uri.toString() !== file.uri.toString()) return null;
+  const cursor = editor.selection.active.line;
+  const { ranges } = reconstruct(file);
+  for (const hunk of file.hunks) {
+    const r = ranges.get(hunk.id);
+    if (r && cursor >= r[0] && cursor < Math.max(r[1], r[0] + 1)) return hunk;
+  }
+  return null;
+}
+
+/**
+ * 应用一次决策（accept/reject/reset）。hunkId 为 number 时（理论上的带参调用）作用于该块；
+ * 否则（状态栏按钮 / 无参快捷键）作用于「当前块」（见 currentHunk）。
+ * @param {number|undefined} hunkId
+ * @param {'accepted'|'rejected'|'pending'} status
+ */
+async function applyDecision(hunkId, status) {
+  if (!reviewSession) {
+    vscode.window.showInformationMessage('Claude Ref: 当前不在 review 中。');
+    return;
+  }
+  const file = reviewSession.files[reviewSession.index];
+  let hunk = null;
+  if (typeof hunkId === 'number') {
+    hunk = file.hunks.find((h) => h.id === hunkId);
+  } else {
+    hunk = currentHunk();
+  }
+  if (!hunk) {
+    vscode.window.showInformationMessage('Claude Ref: 没有可操作的改动块。');
+    return;
+  }
+  hunk.status = status;
+  await rebuildFile(file);
+  // 处理完自动跳到下一个仍待处理的块，连续 review 更顺手；没有则停在原地。
+  if (status !== 'pending') {
+    const nextPending = file.hunks.findIndex((h) => h.status === 'pending');
+    if (nextPending >= 0) gotoHunkIndex(nextPending);
+  }
+}
+
+/**
+ * 跳到当前文件第 idx 个 hunk（按重建后行范围定位光标与视图）。
+ * @param {number} idx
+ */
+function gotoHunkIndex(idx) {
+  if (!reviewSession) return;
+  const file = reviewSession.files[reviewSession.index];
+  if (!file || file.hunks.length === 0) return;
+  const clamped = Math.max(0, Math.min(idx, file.hunks.length - 1));
+  const hunk = file.hunks[clamped];
+  const { ranges } = reconstruct(file);
+  const r = ranges.get(hunk.id);
+  if (!r) return;
+  file._cursor = clamped;
+  const editor = vscode.window.visibleTextEditors.find(
+    (e) => e.document.uri.toString() === file.uri.toString()
+  );
+  if (!editor) return;
+  const pos = new vscode.Position(r[0], 0);
+  editor.selection = new vscode.Selection(pos, pos);
+  editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+  updateReviewNav();
+}
+
+/**
+ * 上/下一块导航。delta=+1 下一块，-1 上一块。
+ * @param {number} delta
+ */
+function gotoHunk(delta) {
+  if (!reviewSession) return;
+  const file = reviewSession.files[reviewSession.index];
+  const cur = typeof file._cursor === 'number' ? file._cursor : 0;
+  gotoHunkIndex(cur + delta);
+}
+
+/**
+ * 跳到下一个待 review 文件的首个 hunk；全部完成则结束会话。
+ * 仅当当前文件无 pending 块时才应被调用（按钮在有 pending 时隐藏）。
+ */
+async function nextFile() {
+  if (!reviewSession) return;
+  const next = reviewSession.index + 1;
+  if (next >= reviewSession.files.length) {
+    await finishReview();
+    return;
+  }
+  await openReviewFile(next);
+}
+
+/**
+ * 回到上一个文件的首个 hunk。已是第一个文件时提示。
+ */
+async function prevFile() {
+  if (!reviewSession) return;
+  if (reviewSession.index <= 0) {
+    vscode.window.showInformationMessage('Claude Ref: 已经是第一个文件了。');
+    return;
+  }
+  await openReviewFile(reviewSession.index - 1);
+}
+
+/**
+ * 结束 review：保存所有改动（按配置）、清理状态与状态栏。
+ */
+async function finishReview() {
+  if (!reviewSession) return;
+  if (!vscode.workspace.getConfiguration('claudeRef').get('reviewAutoSave', false)) {
+    // 未自动保存时，统一把仍 dirty 的 review 文件保存（用户已逐块确认）。
+    for (const f of reviewSession.files) {
+      const doc = vscode.workspace.textDocuments.find(
+        (d) => d.uri.toString() === f.uri.toString()
+      );
+      if (doc && doc.isDirty) {
+        try {
+          await doc.save();
+        } catch (e) { /* ignore */ }
+      }
+    }
+  }
+  // 删除本轮 review 记录，避免下次「开始 review」又能打开已审完的界面。
+  const dir = reviewSession.reviewDirUri;
+  const reviewUris = new Set();
+  for (const f of reviewSession.files) {
+    reviewUris.add(f.baselineUri.toString());
+    reviewUris.add(f.uri.toString());
+    baselineDocs.delete(f.baselineUri.toString());
+  }
+  reviewSession = null;
+  if (dir) await clearReviewRecord(dir);
+  await closeReviewTabs(reviewUris);
+  vscode.commands.executeCommand('setContext', 'claudeRef.reviewActive', false);
+  if (reviewLensProvider) reviewLensProvider.refresh();
+  updateReviewNav();
+  vscode.window.showInformationMessage('Claude Ref: 代码 Review 完成 ✅');
+}
+
+/**
+ * 关闭本轮 review 打开的 diff 标签页。通过 window.tabGroups 找出 TabInputTextDiff
+ * 类型、且其左(original)/右(modified) URI 命中本轮 review 文件的标签并关闭。
+ * 旧版本 VSCode 无 tabGroups API 时静默跳过（不影响其余清理）。
+ * @param {Set<string>} reviewUris 本轮涉及的 baselineUri / fileUri 字符串集合
+ */
+async function closeReviewTabs(reviewUris) {
+  const groups = vscode.window.tabGroups;
+  if (!groups || !Array.isArray(groups.all)) return;
+  const toClose = [];
+  for (const group of groups.all) {
+    for (const tab of group.tabs) {
+      const input = tab.input;
+      // 只处理 diff 标签（TabInputTextDiff 有 original 与 modified 两个 URI）
+      if (!input || !input.original || !input.modified) continue;
+      if (
+        reviewUris.has(input.original.toString()) ||
+        reviewUris.has(input.modified.toString())
+      ) {
+        toClose.push(tab);
+      }
+    }
+  }
+  if (toClose.length > 0) {
+    try {
+      await groups.close(toClose, false);
+    } catch (e) { /* 关闭失败不影响其余清理 */ }
+  }
+}
+
+/**
+ * 创建 review 导航与决策状态栏项。CodeLens 无法在 diff 编辑器内渲染，因此「接受/拒绝/撤销」
+ * 一并放到状态栏，作用于「当前块」（见 currentHunk）。仅 review 进行中显示。
+ * 顺序（从左到右）：进度 · 上一文件 · 上一块 · 下一块 · 接受 · 拒绝 · 撤销 · 下一文件
+ * @returns {vscode.Disposable[]}
+ */
+function registerReviewStatusBar() {
+  const mk = (priority) => vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, priority);
+  const progress = mk(210);
+  const prevFileItem = mk(209);
+  const prev = mk(208);
+  const next = mk(207);
+  const accept = mk(206);
+  const reject = mk(205);
+  const reset = mk(204);
+  const nextFileItem = mk(203);
+
+  prevFileItem.text = '$(arrow-left) 上一个文件';
+  prevFileItem.tooltip = '回到上一个文件';
+  prevFileItem.command = 'claudeRef.prevFile';
+
+  prev.text = '$(arrow-up)';
+  prev.tooltip = '上一个改动块 (Alt+Up)';
+  prev.command = 'claudeRef.prevHunk';
+  next.text = '$(arrow-down)';
+  next.tooltip = '下一个改动块 (Alt+Down)';
+  next.command = 'claudeRef.nextHunk';
+
+  accept.text = '$(check) 接受';
+  accept.tooltip = '接受当前块（保留 Claude 改动）(Alt+A)';
+  accept.command = 'claudeRef.acceptHunk';
+  reject.text = '$(x) 拒绝';
+  reject.tooltip = '拒绝当前块（回退为原代码）(Alt+D)';
+  reject.command = 'claudeRef.rejectHunk';
+  reset.text = '$(discard) 撤销';
+  reset.tooltip = '撤销当前块决策 (Alt+Z)';
+  reset.command = 'claudeRef.resetHunk';
+
+  nextFileItem.text = '下一个文件 $(arrow-right)';
+  nextFileItem.tooltip = '当前文件全部确认后，跳到下一个待 review 文件';
+  nextFileItem.command = 'claudeRef.nextFile';
+
+  reviewNavItems = { progress, prevFile: prevFileItem, prev, next, accept, reject, reset, nextFile: nextFileItem };
+  updateReviewNav();
+  return [progress, prevFileItem, prev, next, accept, reject, reset, nextFileItem];
+}
+
+/**
+ * 按当前 review 状态刷新导航状态栏：无会话时全部隐藏；有会话时显示进度、上一文件、
+ * 上/下块与接受/拒绝/撤销；「下一个文件」仅在当前文件无 pending 块时显示。
+ * 进度文案标注当前块及其状态，弥补 diff 内没有逐块按钮的可见性。
+ */
+function updateReviewNav() {
+  if (!reviewNavItems) return;
+  const { progress, prevFile: prevFileItem, prev, next, accept, reject, reset, nextFile: nextFileItem } = reviewNavItems;
+  const items = [progress, prevFileItem, prev, next, accept, reject, reset, nextFileItem];
+  if (!reviewSession) {
+    items.forEach((it) => it.hide());
+    return;
+  }
+  const file = reviewSession.files[reviewSession.index];
+  const pending = file.hunks.filter((h) => h.status === 'pending').length;
+  const cur = currentHunk();
+  const curIdx = cur ? file.hunks.indexOf(cur) : -1;
+  const statusText = cur
+    ? (cur.status === 'accepted' ? '已接受' : cur.status === 'rejected' ? '已拒绝' : '待处理')
+    : '-';
+  progress.text = `$(git-compare) 文件 ${reviewSession.index + 1}/${reviewSession.files.length} · 块 ${curIdx + 1}/${file.hunks.length}(${statusText}) · 待处理 ${pending}`;
+  progress.tooltip = file.path;
+
+  progress.show();
+  prevFileItem.show();
+  prev.show();
+  next.show();
+  accept.show();
+  reject.show();
+  reset.show();
+
+  // 全部确认（无 pending）才放出「下一个文件」/「完成」
+  if (pending === 0) {
+    const last = reviewSession.index === reviewSession.files.length - 1;
+    nextFileItem.text = last ? '$(check-all) 完成 Review' : '下一个文件 $(arrow-right)';
+    nextFileItem.show();
+  } else {
+    nextFileItem.hide();
+  }
+}
+
+/**
+ * 监听 ready 信号文件，在 Claude 每轮结束、且开启 reviewOnTurnEnd 时自动进入 review。
+ * @returns {vscode.Disposable[]}
+ */
+function registerReviewReadyWatcher() {
+  const onReady = async (uri) => {
+    if (!vscode.workspace.getConfiguration('claudeRef').get('reviewOnTurnEnd', false)) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastReviewReady < 800) return;
+    lastReviewReady = now;
+    // review 进行中则不打断（新一轮基线会在下次首个 PreToolUse 重置）。
+    if (reviewSession) return;
+    const folder = vscode.workspace.getWorkspaceFolder(uri) || (vscode.workspace.workspaceFolders || [])[0];
+    if (!folder) return;
+    await startReviewSession(folder.uri);
+  };
+
+  // 用 RelativePattern 按每个工作区根分别建 watcher——比裸字符串 glob 监听隐藏的
+  // .claude 目录可靠得多（VSCode 对 `**/.xxx` 形式的隐藏目录监听时灵时不灵）。
+  const disposables = [];
+  const folders = vscode.workspace.workspaceFolders || [];
+  for (const folder of folders) {
+    const pattern = new vscode.RelativePattern(folder, REVIEW_READY_RELATIVE);
+    const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    watcher.onDidCreate(onReady);
+    watcher.onDidChange(onReady);
+    disposables.push(watcher);
+  }
+  // 没有工作区或为兜底，再加一个全局 glob watcher（双保险，去抖会避免重复触发）。
+  const fallback = vscode.workspace.createFileSystemWatcher(`**/${REVIEW_READY_RELATIVE}`);
+  fallback.onDidCreate(onReady);
+  fallback.onDidChange(onReady);
+  disposables.push(fallback);
+  return disposables;
+}
+
+/**
+ * 判断一个 hooks 条目是否由本扩展的 review hook 写入（按命令特征串识别）。
+ * @param {any} entry
+ * @returns {boolean}
+ */
+function isOurReviewHookEntry(entry) {
+  return !!(
+    entry &&
+    Array.isArray(entry.hooks) &&
+    entry.hooks.some(
+      (h) => h && typeof h.command === 'string' && h.command.includes(REVIEW_HOOK_MARKER)
+    )
+  );
+}
+
+/**
+ * 把随扩展打包的 review-hook.js 复制到工作区 .claude/claude-ref-review-hook.js。
+ * @param {vscode.Uri} folderUri 工作区根
+ */
+async function copyReviewHookScript(folderUri) {
+  const srcUri = vscode.Uri.file(path.join(extensionContext.extensionPath, 'review-hook.js'));
+  const destUri = vscode.Uri.joinPath(folderUri, REVIEW_HOOK_RELATIVE);
+  const data = await vscode.workspace.fs.readFile(srcUri);
+  await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folderUri, '.claude'));
+  await vscode.workspace.fs.writeFile(destUri, data);
+}
+
+/**
+ * 选择目标工作区根（多工作区时弹选择）。无工作区返回 null。
+ * @param {string} placeHolder
+ * @returns {Promise<vscode.WorkspaceFolder|null>}
+ */
+async function pickWorkspaceFolder(placeHolder) {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) return null;
+  if (folders.length === 1) return folders[0];
+  return (await vscode.window.showWorkspaceFolderPick({ placeHolder })) || null;
+}
+
+/**
+ * 安装 review hook：复制脚本 + 把 PreToolUse(Edit|Write|MultiEdit) 与 Stop 两个 hook
+ * 幂等合并进 .claude/settings.json。命令均为 `node .claude/claude-ref-review-hook.js`。
+ */
+async function installReviewHooks() {
+  const folder = await pickWorkspaceFolder('选择要安装代码 Review Hook 的工作区');
+  if (!folder) {
+    vscode.window.showWarningMessage('Claude Ref: 没有打开的工作区，无法安装 Review Hook。');
+    return;
+  }
+
+  try {
+    await copyReviewHookScript(folder.uri);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Claude Ref: 复制 Review Hook 脚本失败：${e.message}`);
+    return;
+  }
+
+  const settingsUri = vscode.Uri.joinPath(folder.uri, '.claude', 'settings.json');
+  // hook 命令：用 node 跑工作区内的脚本（运行 claude 的环境必然有 node）。
+  // 关键：先判存在再 require——脚本文件缺失（如复制过来的项目只带了 settings.json）时
+  // 静默 no-op，绝不抛 MODULE_NOT_FOUND 阻断 claude。命令里含 'claude-ref-review-hook.js'
+  // 仍可被 isOurReviewHookEntry 识别。
+  const command =
+    "node -e \"var f='.claude/claude-ref-review-hook.js',fs=require('fs');if(fs.existsSync(f))require(require('path').resolve(f))\"";
+
+  let settings = {};
+  try {
+    const raw = await vscode.workspace.fs.readFile(settingsUri);
+    const text = Buffer.from(raw).toString('utf8').trim();
+    if (text) settings = JSON.parse(text);
+  } catch (e) {
+    settings = {};
+  }
+  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+
+  // PreToolUse：matcher 限定文件编辑类工具。先剔除本扩展的旧条目再加入新的，
+  // 使重复安装能「升级」命令（如从旧的裸 node 命令升级到带存在性判断的容错命令）。
+  if (!Array.isArray(settings.hooks.PreToolUse)) settings.hooks.PreToolUse = [];
+  settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((e) => !isOurReviewHookEntry(e));
+  settings.hooks.PreToolUse.push({
+    matcher: 'Edit|Write|MultiEdit',
+    hooks: [{ type: 'command', command }],
+  });
+  // Stop：写 ready 信号
+  if (!Array.isArray(settings.hooks.Stop)) settings.hooks.Stop = [];
+  settings.hooks.Stop = settings.hooks.Stop.filter((e) => !isOurReviewHookEntry(e));
+  settings.hooks.Stop.push({ hooks: [{ type: 'command', command }] });
+
+  try {
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.claude'));
+    const out = Buffer.from(JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    await vscode.workspace.fs.writeFile(settingsUri, out);
+    vscode.window.showInformationMessage(
+      'Claude Ref: 已安装代码 Review Hook（.claude/settings.json）。请重启或重新加载正在运行的 claude 会话后生效。'
+    );
+  } catch (e) {
+    vscode.window.showErrorMessage(`Claude Ref: 写入 Review Hook 失败：${e.message}`);
+  }
+}
+
+/**
+ * 移除本扩展写入的 review hook（PreToolUse + Stop），并删除脚本文件；
+ * 变空的数组/hooks 一并清理。不动其他配置。
+ */
+async function uninstallReviewHooks() {
+  const folder = await pickWorkspaceFolder('选择要移除代码 Review Hook 的工作区');
+  if (!folder) {
+    vscode.window.showWarningMessage('Claude Ref: 没有打开的工作区。');
+    return;
+  }
+  const settingsUri = vscode.Uri.joinPath(folder.uri, '.claude', 'settings.json');
+
+  let settings = {};
+  try {
+    const raw = await vscode.workspace.fs.readFile(settingsUri);
+    const text = Buffer.from(raw).toString('utf8').trim();
+    if (text) settings = JSON.parse(text);
+  } catch (e) {
+    vscode.window.showInformationMessage('Claude Ref: 未找到 .claude/settings.json，无需移除。');
+    return;
+  }
+
+  let changed = false;
+  if (settings.hooks && typeof settings.hooks === 'object') {
+    for (const key of ['PreToolUse', 'Stop']) {
+      const arr = settings.hooks[key];
+      if (!Array.isArray(arr)) continue;
+      const kept = arr.filter((e) => !isOurReviewHookEntry(e));
+      if (kept.length !== arr.length) changed = true;
+      if (kept.length > 0) settings.hooks[key] = kept;
+      else delete settings.hooks[key];
+    }
+    if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  }
+
+  // 删除脚本文件（存在才删）
+  try {
+    await vscode.workspace.fs.delete(vscode.Uri.joinPath(folder.uri, REVIEW_HOOK_RELATIVE));
+  } catch (e) { /* 不存在则忽略 */ }
+
+  if (!changed) {
+    vscode.window.showInformationMessage('Claude Ref: 未发现本扩展写入的 Review Hook。');
+    return;
+  }
+  try {
+    const out = Buffer.from(JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    await vscode.workspace.fs.writeFile(settingsUri, out);
+    vscode.window.showInformationMessage(
+      'Claude Ref: 已移除代码 Review Hook。请重启或重新加载正在运行的 claude 会话后生效。'
+    );
+  } catch (e) {
+    vscode.window.showErrorMessage(`Claude Ref: 移除 Review Hook 失败：${e.message}`);
   }
 }
 

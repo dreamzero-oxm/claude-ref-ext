@@ -5,6 +5,60 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.6.5] - 2026-06-25
+
+### 改进
+
+- **完成 Review 后自动关闭对应的 diff 窗口**：点击「完成 Review」（或处理完最后一个文件）后，本轮 review 打开的所有 diff 标签页会自动关闭，无需手动逐个关。
+
+## [1.6.4] - 2026-06-25
+
+### 修复 / 改进
+
+- **决策后红/绿背景消失**：diff 左侧改为按逐块状态动态重建——接受时左侧用「改后」、拒绝时左侧用「原代码」，与右侧一致，从而该块不再显示红/绿；撤销则恢复。
+- **逐块按钮同时挂到 diff 两侧**：CodeLens（接受/拒绝/撤销）同时注册到右侧真实文件与左侧基线虚拟文档，哪一侧能渲染就显示在哪一侧（状态栏按钮仍作兜底）。
+- **审查记录持久化与清理**：每次接受/拒绝/撤销都把逐块状态写入 `.claude/.claude-ref-review/state.json`，重开 review 会从上次进度继续；点击「完成 Review」后**删除整个 review 记录目录**，下次「开始 Review 本轮改动」不会再打开已审完的界面。
+
+## [1.6.3] - 2026-06-25
+
+### 修复
+
+- **修复改完代码后不自动弹出 review 界面**：`ready` 信号文件位于隐藏目录 `.claude/` 下，旧的裸字符串 glob watcher（`**/.claude/.../ready`）对隐藏目录的监听时灵时不灵。改为按每个工作区根用 `RelativePattern` 建 watcher（并保留一个全局 glob 作兜底），确保信号可靠送达。
+- 配合 1.6.2 的容错 hook：此前 Stop hook 因脚本缺失报错而中断、根本没写出 `ready`，也会表现为「不弹 review」。两者叠加修复后恢复正常。
+
+> 仍未弹出时，可手动执行命令「Claude Ref: 开始 Review 本轮改动」立即进入。
+
+## [1.6.2] - 2026-06-25
+
+### 修复
+
+- **Review Hook 在脚本缺失时不再报错阻断**：旧命令是裸的 `node .claude/claude-ref-review-hook.js`，当某个项目的 `.claude/settings.json` 带有 hook 条目但缺少脚本文件（如复制/克隆来的项目）时，会抛 `MODULE_NOT_FOUND` 报错。现改为带存在性判断的容错命令——脚本不存在则静默 no-op，绝不阻断 claude。
+- **重复安装改为「升级」**：再次执行「安装代码 Review Hook」会先剔除本扩展写入的旧条目再写入新条目，使旧命令能升级为新的容错版本（无需手动删 settings）。
+
+> 已经遇到该报错的项目：在该项目里重新执行一次「Claude Ref: 安装代码 Review Hook」（会自动升级命令并补回脚本），或执行「移除代码 Review Hook」彻底清除，然后重启 claude 会话即可。
+
+## [1.6.1] - 2026-06-25
+
+### 修复 / 改进
+
+- **逐块「接受/拒绝/撤销」按钮改到状态栏**：VSCode 不会在 diff 编辑器内渲染 CodeLens，导致改动块上方看不到按钮。现把「✓ 接受 / ✗ 拒绝 / 撤销」连同导航统一放到底部状态栏，确保可见可点。
+- **决策作用对象改为「当前块」**：不再依赖光标行反查（光标落在 diff 左侧红色基线栏时会落空，导致接受后撤销无效、`待处理` 计数失真、误显示「下一个文件」）。现以导航/光标跟踪的「当前块」为准，并在状态栏进度里显示 `块 x/n(状态)`。
+- **新增「上一个文件」按钮 / 命令 `claudeRef.prevFile`**，与「下一个文件」对称。
+- 接受或拒绝一个块后自动跳到下一个待处理块，连续 review 更顺手。
+
+## [1.6.0] - 2026-06-25
+
+### 新增
+
+- **IDE 内代码 Review（逐块接受/拒绝 Claude 改动）**：Claude Code 改完代码后，在 IDE 中以内置 diff 编辑器呈现「左=改动前原代码（红）/ 右=改动后（绿）」，可逐块 review 并决定保留或回退。
+  - 命令 `claudeRef.installReviewHooks` / `claudeRef.uninstallReviewHooks`（「Claude Ref: 安装/移除代码 Review Hook」）：一键把 `PreToolUse`（`Edit|Write|MultiEdit`）与 `Stop` 两个 hook 幂等写入 `.claude/settings.json`，并复制 `review-hook.js` 到工作区 `.claude/`。`PreToolUse` 在每次编辑前把文件原文快照为「红色基准」，`Stop` 在每轮结束写 `ready` 信号触发 review。
+  - 配置项 `claudeRef.reviewOnTurnEnd`（默认 `false`）：开启后每轮回复结束自动对本轮改动文件进入 review。
+  - 逐块「✓ 接受 / ✗ 拒绝 / 撤销」CodeLens 按钮：**接受**保留 Claude 改后代码，**拒绝**把该块回退为原代码（基于各块状态全量重建文件内容，规避行号漂移）。
+  - 快捷键：`Alt+A` 接受、`Alt+D` 拒绝、`Alt+Z` 撤销（均作用于光标所在块）；`Alt+Down` / `Alt+Up` 跳到下一个/上一个改动块。
+  - 底部状态栏导航：↑/↓ 跳改动块、进度指示，以及「下一个文件」按钮——仅当当前文件所有改动块都已确认（无待处理块）时才出现，点击跳到下一个待 review 文件的首个改动块；全部完成则结束 review。
+  - 配置项 `claudeRef.reviewAutoSave`（默认 `false`）：每次决策后是否自动保存；关闭时保持未保存（dirty）便于撤销，review 结束时统一保存。
+  - 命令 `claudeRef.startReview`（「Claude Ref: 开始 Review 本轮改动」）：手动进入 review。
+
 ## [1.5.0] - 2026-06-25
 
 ### 新增
