@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.6.5",
+  "version": "1.7.0",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",

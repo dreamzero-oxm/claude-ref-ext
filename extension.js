@@ -42,6 +42,9 @@ let reviewSeq = 0;
 const baselineDocs = new Map();
 // BaselineContentProvider 单例（activate 时赋值），决策后用它 fire(uri) 刷新左侧内容。
 let baselineProvider = null;
+// review 单栏高亮用的 decoration 类型（activate 创建）：红=原代码、绿=改后代码。
+let redDecorationType = null;
+let greenDecorationType = null;
 // review 导航用的状态栏项（上/下一块、下一个文件、进度），仅 review 进行中显示。
 let reviewNavItems = null;
 
@@ -865,21 +868,23 @@ function activate(context) {
   );
 
   // ── Review 子系统注册 ──────────────────────────────────────────────────
-  // 基线（diff 左侧）只读虚拟文档提供者；决策后 fire(uri) 刷新左侧使红绿消失。
-  baselineProvider = new BaselineContentProvider();
-  const baselineRegistration = vscode.workspace.registerTextDocumentContentProvider(
-    BASELINE_SCHEME,
-    baselineProvider
-  );
-  // 右侧（改后）文档上的逐块「接受/拒绝/撤销」CodeLens（若当前 VSCode 支持 diff 内渲染）。
+  // 单栏复审高亮：红=原代码、绿=改后代码（整行底色，isWholeLine）。
+  redDecorationType = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    backgroundColor: 'rgba(255, 0, 0, 0.18)',
+    overviewRulerColor: 'rgba(255, 0, 0, 0.6)',
+    overviewRulerLane: vscode.OverviewRulerLane.Left,
+  });
+  greenDecorationType = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    backgroundColor: 'rgba(0, 200, 0, 0.18)',
+    overviewRulerColor: 'rgba(0, 200, 0, 0.6)',
+    overviewRulerLane: vscode.OverviewRulerLane.Left,
+  });
+  // 逐块「接受/拒绝/撤销」CodeLens（普通编辑器内可靠渲染）。
   reviewLensProvider = new ReviewHunkLensProvider();
   const reviewLensRegistration = vscode.languages.registerCodeLensProvider(
     { scheme: 'file' },
-    reviewLensProvider
-  );
-  // 同一 provider 也注册到基线虚拟文档 scheme，使 diff 左侧也可能渲染按钮。
-  const reviewLensRegistrationBaseline = vscode.languages.registerCodeLensProvider(
-    { scheme: BASELINE_SCHEME },
     reviewLensProvider
   );
   // ready 信号 watcher：每轮结束自动进入 review（按 reviewOnTurnEnd 开关）。
@@ -917,7 +922,7 @@ function activate(context) {
     updateReviewNav();
   });
 
-  context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, diagActionRegistration, installHook, uninstallHook, focusClaude, baselineRegistration, reviewLensRegistration, reviewLensRegistrationBaseline, installReview, uninstallReview, startReview, acceptHunk, rejectHunk, resetHunk, nextHunk, prevHunk, nextFileCmd, prevFileCmd, reviewSelectionWatcher);
+  context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, diagActionRegistration, installHook, uninstallHook, focusClaude, redDecorationType, greenDecorationType, reviewLensRegistration, installReview, uninstallReview, startReview, acceptHunk, rejectHunk, resetHunk, nextHunk, prevHunk, nextFileCmd, prevFileCmd, reviewSelectionWatcher);
 }
 
 /**
@@ -1523,25 +1528,54 @@ function reconstruct(file) {
 }
 
 /**
- * 重建 diff「左侧」（基线虚拟文档）文本。关键在于让已决策的块左右两侧一致，从而
- * 不再显示红/绿背景：
- *   pending  → original（与右侧 modified 不同 → 显示红/绿）
- *   accepted → modified（与右侧 modified 相同 → 无颜色）
- *   rejected → original（与右侧 original 相同 → 无颜色）
+ * 重建「复审显示缓冲」：单栏内同时呈现每个改动块的红（原代码，在上）+ 绿（改后，在下）。
+ *   pending  → 输出 original(红) 后接 modified(绿)，两段分别记入 redRanges/greenRanges
+ *   accepted → 只输出 modified，且不着色（决策后背景消除）
+ *   rejected → 只输出 original，且不着色
+ * 返回 { text, redRanges, greenRanges, hunkRanges }，行范围均为 [startLine, endLineExcl)（0 起）。
+ * 这是 review 期间编辑器缓冲的内容来源；红行是物理存在于缓冲里的（VSCode 无虚拟行 API），
+ * 故含 pending 块的文件在全部决策完成前不写盘。
  * @param {{segments:Array<object>}} file
- * @returns {string}
+ * @returns {{text:string, redRanges:number[][], greenRanges:number[][], hunkRanges:Map<number,number[]>}}
  */
-function reconstructLeft(file) {
+function reconstructReview(file) {
   const out = [];
+  const redRanges = [];
+  const greenRanges = [];
+  const hunkRanges = new Map();
   for (const seg of file.segments) {
     if (!seg.changed) {
       for (const line of seg.lines) out.push(line);
       continue;
     }
-    const chosen = seg.hunk.status === 'accepted' ? seg.hunk.modified : seg.hunk.original;
-    for (const line of chosen) out.push(line);
+    const h = seg.hunk;
+    const blockStart = out.length;
+    if (h.status === 'accepted') {
+      for (const l of h.modified) out.push(l);
+    } else if (h.status === 'rejected') {
+      for (const l of h.original) out.push(l);
+    } else {
+      // pending：红（原代码）在上
+      const rs = out.length;
+      for (const l of h.original) out.push(l);
+      if (out.length > rs) redRanges.push([rs, out.length]);
+      // 绿（改后）在下
+      const gs = out.length;
+      for (const l of h.modified) out.push(l);
+      if (out.length > gs) greenRanges.push([gs, out.length]);
+    }
+    hunkRanges.set(h.id, [blockStart, out.length]);
   }
-  return out.join('\n');
+  return { text: out.join('\n'), redRanges, greenRanges, hunkRanges };
+}
+
+/**
+ * 把 [start,endExcl) 行范围数组转成整行高亮用的 Range 数组（endExcl-1 为末行）。
+ * @param {number[][]} ranges
+ * @returns {vscode.Range[]}
+ */
+function toLineRanges(ranges) {
+  return ranges.map((r) => new vscode.Range(r[0], 0, Math.max(r[0], r[1] - 1), 0));
 }
 
 /**
@@ -1581,25 +1615,19 @@ class ReviewHunkLensProvider {
   provideCodeLenses(document) {
     if (!reviewSession) return [];
     const file = reviewSession.files[reviewSession.index];
-    if (!file) return [];
-    // 同时服务 diff 右侧（真实文件）与左侧（基线虚拟文档）——哪一侧能渲染 CodeLens
-    // 就在哪一侧显示按钮。两侧的块行范围都用 reconstruct（右侧重建）的 ranges 近似定位。
-    const docStr = document.uri.toString();
-    const isRight = docStr === file.uri.toString();
-    const isLeft = docStr === file.baselineUri.toString();
-    if (!isRight && !isLeft) return [];
+    if (!file || document.uri.toString() !== file.uri.toString()) return [];
 
-    const { ranges } = reconstruct(file);
+    const { hunkRanges } = reconstructReview(file);
     const lenses = [];
     for (const hunk of file.hunks) {
-      const range = ranges.get(hunk.id);
+      const range = hunkRanges.get(hunk.id);
       if (!range) continue;
       const line = Math.min(range[0], Math.max(0, document.lineCount - 1));
       const lensRange = new vscode.Range(line, 0, line, 0);
       if (hunk.status === 'pending') {
         lenses.push(
-          new vscode.CodeLens(lensRange, { title: '$(check) 接受', command: 'claudeRef.acceptHunk', arguments: [hunk.id] }),
-          new vscode.CodeLens(lensRange, { title: '$(x) 拒绝', command: 'claudeRef.rejectHunk', arguments: [hunk.id] })
+          new vscode.CodeLens(lensRange, { title: '$(check) 接受（保留改后/绿）', command: 'claudeRef.acceptHunk', arguments: [hunk.id] }),
+          new vscode.CodeLens(lensRange, { title: '$(x) 拒绝（保留原代码/红）', command: 'claudeRef.rejectHunk', arguments: [hunk.id] })
         );
       } else if (hunk.status === 'accepted') {
         lenses.push(
@@ -1608,7 +1636,7 @@ class ReviewHunkLensProvider {
         );
       } else {
         lenses.push(
-          new vscode.CodeLens(lensRange, { title: '❌ 已拒绝（保留原代码）', command: 'claudeRef.nextHunk' }),
+          new vscode.CodeLens(lensRange, { title: '❌ 已拒绝', command: 'claudeRef.nextHunk' }),
           new vscode.CodeLens(lensRange, { title: '$(discard) 撤销', command: 'claudeRef.resetHunk', arguments: [hunk.id] })
         );
       }
@@ -1756,41 +1784,57 @@ async function openReviewFile(i) {
   if (!reviewSession) return;
   reviewSession.index = i;
   const file = reviewSession.files[i];
-  const title = `Review: ${file.path} (${i + 1}/${reviewSession.files.length})`;
-  await vscode.commands.executeCommand('vscode.diff', file.baselineUri, file.uri, title, {
-    preview: false,
-  });
+  // 单栏方案：直接打开真实文件，把「复审缓冲」（红原+绿改）写进编辑器，再加红/绿高亮。
+  const doc = await vscode.workspace.openTextDocument(file.uri);
+  const editor = await vscode.window.showTextDocument(doc, { preview: false });
+  await renderReviewBuffer(file, editor);
   if (reviewLensProvider) reviewLensProvider.refresh();
   updateReviewNav();
-  // 跳到首个 hunk
   gotoHunkIndex(0);
 }
 
 /**
- * 改某 hunk 状态后：重建真实文件文本并写盘（WorkspaceEdit 全量覆盖），刷新 CodeLens 与导航。
+ * 把 file 的「复审缓冲」（见 reconstructReview）写入其编辑器并施加红/绿整行高亮。
+ * 含 pending 块时缓冲里物理存在红行，故此时不写盘（保存留到全部决策完成）。
+ * @param {object} file
+ * @param {vscode.TextEditor} [editor]
+ */
+async function renderReviewBuffer(file, editor) {
+  editor = editor || vscode.window.visibleTextEditors.find(
+    (e) => e.document.uri.toString() === file.uri.toString()
+  );
+  if (!editor) return;
+  const { text, redRanges, greenRanges } = reconstructReview(file);
+  const doc = editor.document;
+  if (doc.getText() !== text) {
+    const full = new vscode.Range(new vscode.Position(0, 0), doc.lineAt(doc.lineCount - 1).range.end);
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(file.uri, full, text);
+    await vscode.workspace.applyEdit(edit);
+  }
+  if (redDecorationType) editor.setDecorations(redDecorationType, toLineRanges(redRanges));
+  if (greenDecorationType) editor.setDecorations(greenDecorationType, toLineRanges(greenRanges));
+}
+
+/**
+ * 改某 hunk 状态后：重渲染复审缓冲（含红/绿高亮）、刷新 CodeLens 与导航、持久化状态。
+ * 文件仍有 pending 块时不保存（缓冲含红行，存盘会污染文件）；全部决策完成才落盘。
  * @param {object} file
  */
 async function rebuildFile(file) {
-  const { text } = reconstruct(file);
-  const doc = await vscode.workspace.openTextDocument(file.uri);
-  const full = new vscode.Range(
-    new vscode.Position(0, 0),
-    doc.lineAt(doc.lineCount - 1).range.end
-  );
-  const edit = new vscode.WorkspaceEdit();
-  edit.replace(file.uri, full, text);
-  await vscode.workspace.applyEdit(edit);
+  await renderReviewBuffer(file);
 
-  if (vscode.workspace.getConfiguration('claudeRef').get('reviewAutoSave', false)) {
-    try {
-      await doc.save();
-    } catch (e) { /* ignore */ }
+  const allDecided = file.hunks.every((h) => h.status !== 'pending');
+  if (allDecided && vscode.workspace.getConfiguration('claudeRef').get('reviewAutoSave', false)) {
+    const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === file.uri.toString());
+    if (doc) {
+      try {
+        await doc.save();
+      } catch (e) { /* ignore */ }
+    }
   }
-  // 刷新 diff 左侧虚拟文档：已决策的块左右两侧一致 → 红绿背景消失。
-  if (baselineProvider) baselineProvider.fire(file.baselineUri);
   if (reviewLensProvider) reviewLensProvider.refresh();
   updateReviewNav();
-  // 把逐块状态持久化，重开 review 可续上。
   await writeReviewState();
 }
 
@@ -1824,9 +1868,9 @@ function hunkAtCursor() {
   const editor = vscode.window.activeTextEditor;
   if (!file || !editor || editor.document.uri.toString() !== file.uri.toString()) return null;
   const cursor = editor.selection.active.line;
-  const { ranges } = reconstruct(file);
+  const { hunkRanges } = reconstructReview(file);
   for (const hunk of file.hunks) {
-    const r = ranges.get(hunk.id);
+    const r = hunkRanges.get(hunk.id);
     if (r && cursor >= r[0] && cursor < Math.max(r[1], r[0] + 1)) return hunk;
   }
   return null;
@@ -1873,8 +1917,8 @@ function gotoHunkIndex(idx) {
   if (!file || file.hunks.length === 0) return;
   const clamped = Math.max(0, Math.min(idx, file.hunks.length - 1));
   const hunk = file.hunks[clamped];
-  const { ranges } = reconstruct(file);
-  const r = ranges.get(hunk.id);
+  const { hunkRanges } = reconstructReview(file);
+  const r = hunkRanges.get(hunk.id);
   if (!r) return;
   file._cursor = clamped;
   const editor = vscode.window.visibleTextEditors.find(
@@ -1929,30 +1973,31 @@ async function prevFile() {
  */
 async function finishReview() {
   if (!reviewSession) return;
-  if (!vscode.workspace.getConfiguration('claudeRef').get('reviewAutoSave', false)) {
-    // 未自动保存时，统一把仍 dirty 的 review 文件保存（用户已逐块确认）。
-    for (const f of reviewSession.files) {
-      const doc = vscode.workspace.textDocuments.find(
-        (d) => d.uri.toString() === f.uri.toString()
-      );
-      if (doc && doc.isDirty) {
-        try {
-          await doc.save();
-        } catch (e) { /* ignore */ }
-      }
+  const files = reviewSession.files.slice();
+  // 收尾：把每个文件里仍 pending 的块按「保留 Claude 改动（绿）」定稿，重渲染成只含最终代码
+  // 的干净缓冲（不再有红行），清掉高亮并保存。
+  for (const f of files) {
+    for (const h of f.hunks) {
+      if (h.status === 'pending') h.status = 'accepted';
+    }
+    await renderReviewBuffer(f);
+    const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === f.uri.toString());
+    if (editor) {
+      if (redDecorationType) editor.setDecorations(redDecorationType, []);
+      if (greenDecorationType) editor.setDecorations(greenDecorationType, []);
+    }
+    const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === f.uri.toString());
+    if (doc) {
+      try {
+        await doc.save();
+      } catch (e) { /* ignore */ }
     }
   }
   // 删除本轮 review 记录，避免下次「开始 review」又能打开已审完的界面。
   const dir = reviewSession.reviewDirUri;
-  const reviewUris = new Set();
-  for (const f of reviewSession.files) {
-    reviewUris.add(f.baselineUri.toString());
-    reviewUris.add(f.uri.toString());
-    baselineDocs.delete(f.baselineUri.toString());
-  }
+  for (const f of reviewSession.files) baselineDocs.delete(f.baselineUri.toString());
   reviewSession = null;
   if (dir) await clearReviewRecord(dir);
-  await closeReviewTabs(reviewUris);
   vscode.commands.executeCommand('setContext', 'claudeRef.reviewActive', false);
   if (reviewLensProvider) reviewLensProvider.refresh();
   updateReviewNav();
