@@ -3,12 +3,10 @@ const path = require('path');
 const cp = require('child_process');
 
 // 记录「当前正在运行 Claude Code」的终端集合，由 shell 集成事件维护。
+// 仅服务 requireClaudeRunning 门禁（判断当前活动终端是否在跑 claude）。
 const claudeTerminals = new Set();
 // 终端不支持 shell 集成、无法检测时只提示一次，避免反复打扰。
 let degradeWarned = false;
-// 状态栏指示项：显示当前有几个 claude 会话在跑，让 requireClaudeRunning 的门禁状态可见。
-// 在 activate() 中创建，shell 集成事件触发时刷新。
-let statusBarItem = null;
 
 // Stop hook 写入的信号文件（相对工作区根目录）。Claude Code 每轮回复结束会触发
 // Stop hook，由 hook 更新此文件；扩展通过 FileSystemWatcher 监听其变化来弹出
@@ -424,16 +422,6 @@ function sendRefs(refs) {
 }
 
 /**
- * 返回当前仍打开着、且正在运行 Claude Code 的终端列表
- * （claudeTerminals 与现存终端取交集，剔除已关闭的悬挂项）。
- * @returns {vscode.Terminal[]}
- */
-function openClaudeTerminals() {
-  const open = new Set(vscode.window.terminals);
-  return [...claudeTerminals].filter((t) => open.has(t));
-}
-
-/**
  * 当前 VSCode 是否支持终端 Shell 集成（据此才能检测哪些终端在跑 claude）。
  * @returns {boolean}
  */
@@ -442,60 +430,7 @@ function shellIntegrationAvailable() {
 }
 
 /**
- * 在多个「正在运行 Claude Code」的终端之间弹 quick-pick 让用户选发送目标。
- * 用户取消（Esc）返回 null。
- * @param {vscode.Terminal[]} terminals
- * @returns {Promise<vscode.Terminal|null>}
- */
-async function pickClaudeTerminal(terminals) {
-  const active = vscode.window.activeTerminal;
-  const items = terminals.map((t) => ({
-    label: `$(terminal) ${t.name}`,
-    description: t === active ? '当前活动终端' : '',
-    _terminal: t,
-  }));
-  const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: '检测到多个正在运行 Claude Code 的终端，选择发送目标',
-  });
-  return picked ? picked._terminal : null;
-}
-
-/**
- * 解析本次发送的目标终端。优先级：
- *   1. 配置了 terminalName 且找到同名终端 → 用它；
- *   2. 有「正在跑 claude」的终端时以它们为候选——多个且开启 promptWhenMultiple 时
- *      弹 quick-pick 让用户选（取消则返回 null 表示中止）；多个但不弹则优先当前活动终端、
- *      否则取第一个；恰好一个则直接用它（即便它不是当前活动终端，也优先打到 claude 会话里）；
- *   3. 没有任何已知 claude 终端 → 沿用历史行为，用当前活动终端（可能为空，由调用方决定是否新建）。
- * @param {string} terminalName 配置的目标终端名（可为空）
- * @param {boolean} promptWhenMultiple 多个 claude 终端时是否弹选择
- * @returns {Promise<vscode.Terminal|null|undefined>} null=用户取消选择；undefined/Terminal 见上
- */
-async function resolveTargetTerminal(terminalName, promptWhenMultiple) {
-  if (terminalName) {
-    const named = vscode.window.terminals.find((t) => t.name === terminalName);
-    if (named) {
-      return named;
-    }
-  }
-
-  const claudeOpen = openClaudeTerminals();
-  if (claudeOpen.length > 1) {
-    if (promptWhenMultiple) {
-      // 用户取消时返回 null，sendPayload 据此中止发送（不擅自挑一个）
-      return await pickClaudeTerminal(claudeOpen);
-    }
-    const active = vscode.window.activeTerminal;
-    return active && claudeTerminals.has(active) ? active : claudeOpen[0];
-  }
-  if (claudeOpen.length === 1) {
-    return claudeOpen[0];
-  }
-  return vscode.window.activeTerminal || undefined;
-}
-
-/**
- * 把一段 payload 发送到目标终端：解析目标终端、执行 requireClaudeRunning 门禁、
+ * 把一段 payload 发送到当前活动终端：执行 requireClaudeRunning 门禁、
  * 按配置决定焦点与是否回车提交。引用与诊断两条路径共用此函数。
  *
  * 交互式 claude 会话中「换行＝提交」，因此含内部换行的多行 payload 必须用
@@ -508,17 +443,11 @@ async function sendPayload(payload, opts) {
   const bracketedPaste = !!(opts && opts.bracketedPaste);
   const cfg = vscode.workspace.getConfiguration('claudeRef');
   const submitOnSend = cfg.get('submitOnSend', false);
-  const terminalName = cfg.get('terminalName', '');
   const focusTerminalOnSend = cfg.get('focusTerminalOnSend', false);
   const requireClaudeRunning = cfg.get('requireClaudeRunning', false);
-  const promptForTerminalWhenMultiple = cfg.get('promptForTerminalWhenMultiple', true);
 
-  // 解析目标终端：按名称 / 多 claude 会话选择 / 当前活动终端（见 resolveTargetTerminal）。
-  // 返回 null 表示用户在「多会话选择」里取消了，直接中止本次发送。
-  let terminal = await resolveTargetTerminal(terminalName, promptForTerminalWhenMultiple);
-  if (terminal === null) {
-    return;
-  }
+  // 始终发送到当前活动终端（没有则在门禁通过后新建一个）。
+  let terminal = vscode.window.activeTerminal;
 
   // 开启「仅在 Claude Code 运行时发送」时，发送前确认目标终端确实在跑 claude，
   // 避免把 @path 引用漏打进一个普通 shell（在那里没有意义）。
@@ -540,14 +469,14 @@ async function sendPayload(payload, opts) {
       }
     } else if (!claudeTerminals.has(terminal)) {
       vscode.window.showWarningMessage(
-        'Claude Ref: 目标终端未在运行 Claude Code，已取消发送。'
+        'Claude Ref: 当前活动终端未在运行 Claude Code，已取消发送。'
       );
       return;
     }
   }
 
   if (!terminal) {
-    terminal = vscode.window.createTerminal(terminalName || 'claude');
+    terminal = vscode.window.createTerminal('claude');
   }
 
   // show 的参数为 preserveFocus：true 表示保留当前焦点（停留在编辑器），
@@ -613,6 +542,10 @@ class SendSelectionLensProvider {
   }
 
   provideCodeLenses(document) {
+    // 配置关闭时不提供选区气泡（可在设置 claudeRef.showSelectionCodeLens 中开关）
+    if (!vscode.workspace.getConfiguration('claudeRef').get('showSelectionCodeLens', true)) {
+      return [];
+    }
     const editor = vscode.window.activeTextEditor;
     // 仅为当前活动编辑器、且其选区非空时提供
     if (!editor || editor.document.uri.toString() !== document.uri.toString()) {
@@ -830,6 +763,12 @@ function activate(context) {
   const selectionWatcher = vscode.window.onDidChangeTextEditorSelection(() => {
     lensProvider.refresh();
   });
+  // 配置 showSelectionCodeLens 变更时立刻刷新，使开关即时生效（无需切换选区）
+  const lensConfigWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('claudeRef.showSelectionCodeLens')) {
+      lensProvider.refresh();
+    }
+  });
 
   // 诊断灯泡：在有诊断的行提供「💬 让 Claude 修复此问题」快速修复，指向 sendDiagnostics
   const diagActionRegistration = vscode.languages.registerCodeActionsProvider(
@@ -842,15 +781,6 @@ function activate(context) {
   // 命令开始执行且命令行匹配（默认 claude，可配置）时标记该终端，结束时清除。
   // 供「仅在 Claude Code 运行时发送」(requireClaudeRunning) 的门禁判断使用。
   context.subscriptions.push(...registerShellExecutionTracking());
-
-  // 状态栏指示：显示当前有几个 claude 会话在跑，让门禁状态可见、并作为多会话选择入口。
-  context.subscriptions.push(...registerStatusBar());
-
-  // 状态栏点击 / 命令面板：聚焦（多个时先选择）正在运行 Claude Code 的终端。
-  const focusClaude = vscode.commands.registerCommand(
-    'claudeRef.focusClaudeTerminal',
-    focusClaudeTerminal
-  );
 
   // 监听 Stop hook 信号文件，在 Claude Code 每轮回复结束时弹提示（按配置开关）。
   context.subscriptions.push(...registerTurnEndNotifier());
@@ -910,6 +840,8 @@ function activate(context) {
   const acceptHunk = vscode.commands.registerCommand('claudeRef.acceptHunk', (id) => applyDecision(id, 'accepted'));
   const rejectHunk = vscode.commands.registerCommand('claudeRef.rejectHunk', (id) => applyDecision(id, 'rejected'));
   const resetHunk = vscode.commands.registerCommand('claudeRef.resetHunk', (id) => applyDecision(id, 'pending'));
+  const acceptAll = vscode.commands.registerCommand('claudeRef.acceptAllHunks', () => applyDecisionAll('accepted'));
+  const rejectAll = vscode.commands.registerCommand('claudeRef.rejectAllHunks', () => applyDecisionAll('rejected'));
   const nextHunk = vscode.commands.registerCommand('claudeRef.nextHunk', () => gotoHunk(1));
   const prevHunk = vscode.commands.registerCommand('claudeRef.prevHunk', () => gotoHunk(-1));
   const nextFileCmd = vscode.commands.registerCommand('claudeRef.nextFile', () => nextFile());
@@ -922,125 +854,7 @@ function activate(context) {
     updateReviewNav();
   });
 
-  context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, diagActionRegistration, installHook, uninstallHook, focusClaude, redDecorationType, greenDecorationType, reviewLensRegistration, installReview, uninstallReview, startReview, acceptHunk, rejectHunk, resetHunk, nextHunk, prevHunk, nextFileCmd, prevFileCmd, reviewSelectionWatcher);
-}
-
-/**
- * 创建状态栏指示项并首次刷新。仅在配置 claudeRef.showStatusBar 开启时创建。
- * 点击指示项执行 claudeRef.focusClaudeTerminal（聚焦/选择 claude 终端）。
- * @returns {vscode.Disposable[]} 需要 dispose 的资源（含状态栏项与配置变更监听）
- */
-function registerStatusBar() {
-  const disposables = [];
-
-  const create = () => {
-    if (statusBarItem) {
-      return;
-    }
-    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    statusBarItem.command = 'claudeRef.focusClaudeTerminal';
-    disposables.push(statusBarItem);
-    updateStatusBar();
-  };
-  const destroy = () => {
-    if (statusBarItem) {
-      statusBarItem.dispose();
-      statusBarItem = null;
-    }
-  };
-
-  if (vscode.workspace.getConfiguration('claudeRef').get('showStatusBar', true)) {
-    create();
-  }
-
-  // 配置变更时按需创建/销毁或刷新（showStatusBar、requireClaudeRunning 都影响显示）
-  disposables.push(
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (!e.affectsConfiguration('claudeRef')) {
-        return;
-      }
-      if (vscode.workspace.getConfiguration('claudeRef').get('showStatusBar', true)) {
-        create();
-        updateStatusBar();
-      } else {
-        destroy();
-      }
-    })
-  );
-
-  return disposables;
-}
-
-/**
- * 按当前 claude 会话数刷新状态栏文案、提示与配色。
- *   - 无会话：暗色图标；开启 requireClaudeRunning 时标为警告色（发送会被拦截）。
- *   - 有会话：显示数量；多个时提示「点击选择目标终端」。
- *   - shell 集成不可用：显示「未知」状态，说明无法检测。
- * 没有创建状态栏项（showStatusBar 关闭）时直接返回。
- */
-function updateStatusBar() {
-  if (!statusBarItem) {
-    return;
-  }
-  const requireClaudeRunning = vscode.workspace
-    .getConfiguration('claudeRef')
-    .get('requireClaudeRunning', false);
-
-  if (!shellIntegrationAvailable()) {
-    statusBarItem.text = '$(question) Claude';
-    statusBarItem.tooltip =
-      '无法检测 Claude Code 会话（当前 VSCode 不支持终端 Shell 集成）';
-    statusBarItem.backgroundColor = undefined;
-    statusBarItem.show();
-    return;
-  }
-
-  const count = openClaudeTerminals().length;
-  if (count === 0) {
-    statusBarItem.text = '$(circle-slash) Claude';
-    statusBarItem.tooltip = requireClaudeRunning
-      ? '未检测到 Claude Code 会话；已开启「仅在 Claude Code 运行时发送」，发送将被拦截'
-      : '未检测到 Claude Code 会话';
-    // 门禁开启且无会话时用警告色，让「发送会被拦截」一目了然
-    statusBarItem.backgroundColor = requireClaudeRunning
-      ? new vscode.ThemeColor('statusBarItem.warningBackground')
-      : undefined;
-  } else {
-    statusBarItem.text = `$(comment-discussion) Claude ${count}`;
-    statusBarItem.tooltip =
-      count > 1
-        ? `检测到 ${count} 个 Claude Code 会话，点击选择发送目标终端`
-        : '检测到 1 个 Claude Code 会话，点击聚焦';
-    statusBarItem.backgroundColor = undefined;
-  }
-  statusBarItem.show();
-}
-
-/**
- * 状态栏点击 / 命令面板触发：聚焦正在运行 Claude Code 的终端。
- * 多个时弹 quick-pick 选一个，恰好一个则直接聚焦，没有则提示。
- */
-async function focusClaudeTerminal() {
-  if (!shellIntegrationAvailable()) {
-    vscode.window.showInformationMessage(
-      'Claude Ref: 当前 VSCode 不支持终端 Shell 集成，无法检测 Claude Code 会话。'
-    );
-    return;
-  }
-  const claudeOpen = openClaudeTerminals();
-  if (claudeOpen.length === 0) {
-    vscode.window.showInformationMessage('Claude Ref: 未检测到正在运行 Claude Code 的终端。');
-    return;
-  }
-  let terminal = claudeOpen[0];
-  if (claudeOpen.length > 1) {
-    const picked = await pickClaudeTerminal(claudeOpen);
-    if (!picked) {
-      return;
-    }
-    terminal = picked;
-  }
-  terminal.show(false); // 抢占焦点，把光标落到终端
+  context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, lensConfigWatcher, diagActionRegistration, installHook, uninstallHook, redDecorationType, greenDecorationType, reviewLensRegistration, installReview, uninstallReview, startReview, acceptHunk, rejectHunk, resetHunk, acceptAll, rejectAll, nextHunk, prevHunk, nextFileCmd, prevFileCmd, reviewSelectionWatcher);
 }
 
 /**
@@ -1057,7 +871,6 @@ function registerShellExecutionTracking() {
         const commandLine = e.execution && e.execution.commandLine && e.execution.commandLine.value;
         if (matchesClaudeCommand(commandLine || '')) {
           claudeTerminals.add(e.terminal);
-          updateStatusBar();
         }
       })
     );
@@ -1070,7 +883,6 @@ function registerShellExecutionTracking() {
         // claude 进程退出（其启动命令执行结束）时，取消该终端的标记
         if (matchesClaudeCommand(commandLine || '')) {
           claudeTerminals.delete(e.terminal);
-          updateStatusBar();
         }
       })
     );
@@ -1080,7 +892,6 @@ function registerShellExecutionTracking() {
   disposables.push(
     vscode.window.onDidCloseTerminal((terminal) => {
       claudeTerminals.delete(terminal);
-      updateStatusBar();
     })
   );
 
@@ -1627,7 +1438,9 @@ class ReviewHunkLensProvider {
       if (hunk.status === 'pending') {
         lenses.push(
           new vscode.CodeLens(lensRange, { title: '$(check) 接受（保留改后/绿）', command: 'claudeRef.acceptHunk', arguments: [hunk.id] }),
-          new vscode.CodeLens(lensRange, { title: '$(x) 拒绝（保留原代码/红）', command: 'claudeRef.rejectHunk', arguments: [hunk.id] })
+          new vscode.CodeLens(lensRange, { title: '$(x) 拒绝（保留原代码/红）', command: 'claudeRef.rejectHunk', arguments: [hunk.id] }),
+          new vscode.CodeLens(lensRange, { title: '$(check-all) 接受全部', command: 'claudeRef.acceptAllHunks' }),
+          new vscode.CodeLens(lensRange, { title: '$(close-all) 拒绝全部', command: 'claudeRef.rejectAllHunks' })
         );
       } else if (hunk.status === 'accepted') {
         lenses.push(
@@ -1908,6 +1721,26 @@ async function applyDecision(hunkId, status) {
 }
 
 /**
+ * 对当前文件所有「待处理」(pending) 的改动块一次性应用决策（接受全部 / 拒绝全部）。
+ * 已决策的块不动，只覆盖 pending 的；之后重渲染、刷新与持久化（复用 rebuildFile）。
+ * @param {'accepted'|'rejected'} status
+ */
+async function applyDecisionAll(status) {
+  if (!reviewSession) {
+    vscode.window.showInformationMessage('Claude Ref: 当前不在 review 中。');
+    return;
+  }
+  const file = reviewSession.files[reviewSession.index];
+  const pending = file.hunks.filter((h) => h.status === 'pending');
+  if (pending.length === 0) {
+    vscode.window.showInformationMessage('Claude Ref: 当前文件没有待处理的改动块。');
+    return;
+  }
+  for (const h of pending) h.status = status;
+  await rebuildFile(file);
+}
+
+/**
  * 跳到当前文件第 idx 个 hunk（按重建后行范围定位光标与视图）。
  * @param {number} idx
  */
@@ -2037,7 +1870,7 @@ async function closeReviewTabs(reviewUris) {
 /**
  * 创建 review 导航与决策状态栏项。CodeLens 无法在 diff 编辑器内渲染，因此「接受/拒绝/撤销」
  * 一并放到状态栏，作用于「当前块」（见 currentHunk）。仅 review 进行中显示。
- * 顺序（从左到右）：进度 · 上一文件 · 上一块 · 下一块 · 接受 · 拒绝 · 撤销 · 下一文件
+ * 顺序（从左到右）：进度 · 上一文件 · 上一块 · 下一块 · 接受 · 拒绝 · 撤销 · 接受全部 · 拒绝全部 · 下一文件
  * @returns {vscode.Disposable[]}
  */
 function registerReviewStatusBar() {
@@ -2049,7 +1882,9 @@ function registerReviewStatusBar() {
   const accept = mk(206);
   const reject = mk(205);
   const reset = mk(204);
-  const nextFileItem = mk(203);
+  const acceptAll = mk(203);
+  const rejectAll = mk(202);
+  const nextFileItem = mk(201);
 
   prevFileItem.text = '$(arrow-left) 上一个文件';
   prevFileItem.tooltip = '回到上一个文件';
@@ -2072,24 +1907,32 @@ function registerReviewStatusBar() {
   reset.tooltip = '撤销当前块决策 (Alt+Z)';
   reset.command = 'claudeRef.resetHunk';
 
+  acceptAll.text = '$(check-all) 接受全部';
+  acceptAll.tooltip = '接受当前文件所有待处理的改动块（保留 Claude 改动）';
+  acceptAll.command = 'claudeRef.acceptAllHunks';
+  rejectAll.text = '$(close-all) 拒绝全部';
+  rejectAll.tooltip = '拒绝当前文件所有待处理的改动块（回退为原代码）';
+  rejectAll.command = 'claudeRef.rejectAllHunks';
+
   nextFileItem.text = '下一个文件 $(arrow-right)';
   nextFileItem.tooltip = '当前文件全部确认后，跳到下一个待 review 文件';
   nextFileItem.command = 'claudeRef.nextFile';
 
-  reviewNavItems = { progress, prevFile: prevFileItem, prev, next, accept, reject, reset, nextFile: nextFileItem };
+  reviewNavItems = { progress, prevFile: prevFileItem, prev, next, accept, reject, reset, acceptAll, rejectAll, nextFile: nextFileItem };
   updateReviewNav();
-  return [progress, prevFileItem, prev, next, accept, reject, reset, nextFileItem];
+  return [progress, prevFileItem, prev, next, accept, reject, reset, acceptAll, rejectAll, nextFileItem];
 }
 
 /**
  * 按当前 review 状态刷新导航状态栏：无会话时全部隐藏；有会话时显示进度、上一文件、
- * 上/下块与接受/拒绝/撤销；「下一个文件」仅在当前文件无 pending 块时显示。
+ * 上/下块与接受/拒绝/撤销；「接受全部/拒绝全部」仅在当前文件还有 pending 块时显示；
+ * 「下一个文件」仅在当前文件无 pending 块时显示。
  * 进度文案标注当前块及其状态，弥补 diff 内没有逐块按钮的可见性。
  */
 function updateReviewNav() {
   if (!reviewNavItems) return;
-  const { progress, prevFile: prevFileItem, prev, next, accept, reject, reset, nextFile: nextFileItem } = reviewNavItems;
-  const items = [progress, prevFileItem, prev, next, accept, reject, reset, nextFileItem];
+  const { progress, prevFile: prevFileItem, prev, next, accept, reject, reset, acceptAll, rejectAll, nextFile: nextFileItem } = reviewNavItems;
+  const items = [progress, prevFileItem, prev, next, accept, reject, reset, acceptAll, rejectAll, nextFileItem];
   if (!reviewSession) {
     items.forEach((it) => it.hide());
     return;
@@ -2112,13 +1955,17 @@ function updateReviewNav() {
   reject.show();
   reset.show();
 
-  // 全部确认（无 pending）才放出「下一个文件」/「完成」
-  if (pending === 0) {
+  // 还有 pending 块时给出「接受全部/拒绝全部」批量入口；全部确认后隐藏，换上「下一个文件」/「完成」
+  if (pending > 0) {
+    acceptAll.show();
+    rejectAll.show();
+    nextFileItem.hide();
+  } else {
+    acceptAll.hide();
+    rejectAll.hide();
     const last = reviewSession.index === reviewSession.files.length - 1;
     nextFileItem.text = last ? '$(check-all) 完成 Review' : '下一个文件 $(arrow-right)';
     nextFileItem.show();
-  } else {
-    nextFileItem.hide();
   }
 }
 

@@ -5,6 +5,24 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.8.0] - 2026-06-30
+
+### 新增（Review 批量决策）
+
+- **选区 CodeLens 气泡开关**：新增配置项 `claudeRef.showSelectionCodeLens`（默认 `true`）。关闭后选中代码不再显示「💬 将选中引用添加到终端」气泡，仍可用快捷键/右键菜单/命令面板发送；改动即时生效。
+- **「接受全部 / 拒绝全部」**：Review 当前文件时可一键对**所有待处理（未确认）改动块**统一接受（保留 Claude 改动）或拒绝（回退原代码），已决策的块不受影响。
+  - 入口：底部状态栏按钮（仅当前文件还有待处理块时显示）、改动块上方 CodeLens、命令面板（`Claude Ref: 接受/拒绝当前文件全部改动块`）。
+  - 快捷键：`Alt+Shift+A`（接受全部）、`Alt+Shift+D`（拒绝全部），仅 review 进行中且聚焦编辑器时生效。
+
+### 移除（简化终端发送）
+
+- **不再「选择目标终端」，引用一律发送到当前活动终端**。随之移除：
+  - 配置项 `claudeRef.terminalName`（按名称指定/新建目标终端）
+  - 配置项 `claudeRef.promptForTerminalWhenMultiple` 与多会话 quick-pick 选择弹窗
+  - 配置项 `claudeRef.showStatusBar` 与状态栏会话计数指示项
+  - 命令 `claudeRef.focusClaudeTerminal`（聚焦/选择 Claude Code 终端）
+- `claudeRef.requireClaudeRunning` 门禁保留：现针对**当前活动终端**判断是否在跑 claude（仍基于 Shell 集成追踪，不支持时降级为照常发送）。
+
 ## [1.7.0] - 2026-06-25
 
 ### 变更（Review 呈现方式重做）

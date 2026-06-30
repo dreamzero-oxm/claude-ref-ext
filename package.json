@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",
@@ -70,10 +70,6 @@
         "title": "Claude Ref: 移除对话结束提示 Hook"
       },
       {
-        "command": "claudeRef.focusClaudeTerminal",
-        "title": "Claude Ref: 聚焦正在运行的 Claude Code 终端"
-      },
-      {
         "command": "claudeRef.installReviewHooks",
         "title": "Claude Ref: 安装代码 Review Hook"
       },
@@ -96,6 +92,14 @@
       {
         "command": "claudeRef.resetHunk",
         "title": "Claude Ref: 撤销当前改动块决策"
+      },
+      {
+        "command": "claudeRef.acceptAllHunks",
+        "title": "Claude Ref: 接受当前文件全部改动块"
+      },
+      {
+        "command": "claudeRef.rejectAllHunks",
+        "title": "Claude Ref: 拒绝当前文件全部改动块（保留原代码）"
       },
       {
         "command": "claudeRef.nextHunk",
@@ -140,6 +144,16 @@
       {
         "command": "claudeRef.resetHunk",
         "key": "alt+z",
+        "when": "claudeRef.reviewActive && editorTextFocus"
+      },
+      {
+        "command": "claudeRef.acceptAllHunks",
+        "key": "alt+shift+a",
+        "when": "claudeRef.reviewActive && editorTextFocus"
+      },
+      {
+        "command": "claudeRef.rejectAllHunks",
+        "key": "alt+shift+d",
         "when": "claudeRef.reviewActive && editorTextFocus"
       },
       {
@@ -211,30 +225,20 @@
           "default": false,
           "description": "发送引用后是否把焦点切换到终端。开启后点击 CodeLens 气泡或使用快捷键发送引用时，光标会直接落到终端；关闭则保持焦点停留在编辑器。"
         },
-        "claudeRef.terminalName": {
-          "type": "string",
-          "default": "",
-          "description": "目标终端名称。留空则使用当前活动终端；填写后会优先查找同名终端，找不到则新建。"
+        "claudeRef.showSelectionCodeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "在编辑器中选中代码时，于选区上方显示「💬 将选中引用添加到终端」的 CodeLens 气泡。关闭后不再显示该气泡，仍可用快捷键、右键菜单或命令面板发送选区引用。"
         },
         "claudeRef.requireClaudeRunning": {
           "type": "boolean",
           "default": false,
-          "description": "仅在目标终端正在运行 Claude Code 时才发送引用。开启后，若检测到目标终端没有在跑 claude，则取消发送并提示，避免把 @path 引用误打进普通 shell。依赖 VSCode 终端 Shell 集成；不支持时会降级为照常发送。"
+          "description": "仅在当前活动终端正在运行 Claude Code 时才发送引用。开启后，若检测到当前活动终端没有在跑 claude，则取消发送并提示，避免把 @path 引用误打进普通 shell。依赖 VSCode 终端 Shell 集成；不支持时会降级为照常发送。"
         },
         "claudeRef.claudeCommandPattern": {
           "type": "string",
           "default": "claude",
           "description": "用于识别 Claude Code 的命令名（正则，不区分大小写）。命令不叫 claude 时（如 claude-other）按需修改，例如填写 'claude|claude-other' 以同时匹配两者。仅在开启 claudeRef.requireClaudeRunning 时生效。"
-        },
-        "claudeRef.promptForTerminalWhenMultiple": {
-          "type": "boolean",
-          "default": true,
-          "description": "检测到多个正在运行 Claude Code 的终端时，发送前弹出选择让你挑一个目标终端。关闭则不询问，自动选当前活动的 claude 终端（没有则取第一个）。仅在能检测到 claude 会话时生效（依赖 VSCode 终端 Shell 集成）；已通过 claudeRef.terminalName 指定固定终端时不询问。"
-        },
-        "claudeRef.showStatusBar": {
-          "type": "boolean",
-          "default": true,
-          "description": "在状态栏显示一个指示项，展示当前检测到的 Claude Code 会话数量；点击可聚焦（多个时选择）对应终端。开启「仅在 Claude Code 运行时发送」且无会话时，指示项会变为警告色提示发送将被拦截。依赖 VSCode 终端 Shell 集成；不支持时显示为「未知」。"
         },
         "claudeRef.notifyOnTurnEnd": {
           "type": "boolean",
