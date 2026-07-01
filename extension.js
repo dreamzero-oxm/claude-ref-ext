@@ -854,6 +854,10 @@ function activate(context) {
     updateReviewNav();
   });
 
+  // 在 Git diff 视图（git: scheme 虚拟文档）里桥接「转到定义/查看引用」等语言导航，
+  // 使 diff 内符号跳转体验与普通编辑器一致（按 claudeRef.enableDiffNavigation 开关，运行时生效）。
+  context.subscriptions.push(...registerDiffNavigationProviders());
+
   context.subscriptions.push(sendSelection, sendFile, sendDiagnostics, sendSymbol, sendGitChanges, sendWithTemplate, lensRegistration, selectionWatcher, lensConfigWatcher, diagActionRegistration, installHook, uninstallHook, redDecorationType, greenDecorationType, reviewLensRegistration, installReview, uninstallReview, startReview, acceptHunk, rejectHunk, resetHunk, acceptAll, rejectAll, nextHunk, prevHunk, nextFileCmd, prevFileCmd, reviewSelectionWatcher);
 }
 
@@ -2160,6 +2164,220 @@ async function uninstallReviewHooks() {
   } catch (e) {
     vscode.window.showErrorMessage(`Claude Ref: 移除 Review Hook 失败：${e.message}`);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Diff 视图内「转到定义 / 查看引用」桥接：VSCode 内置 Git diff 里，原始/历史版本
+// 是 git: scheme 的只读虚拟文档，语言服务器只为 file scheme 文档提供定义/引用，
+// 故直接在 diff 里按 F12 无效。这里为 git scheme 注册一组「桥接」Provider：把请求
+// 还原到磁盘上的真实文件，委派给 VSCode 内置命令求解，再把结果（file scheme 的
+// Location）原样返回，使 diff 内的符号跳转体验与普通编辑器一致。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 由 diff 虚拟文档的 URI 还原出磁盘上真实文件的 URI。
+ * git 扩展生成的 URI 形如 git:/abs/path/file.ts?{"path":"...","ref":"~"}，
+ * 其 uri.fsPath 就是真实文件的绝对路径（VSCode 构造该 URI 时已解析好）。
+ * @param {vscode.Uri} uri
+ * @returns {vscode.Uri|null}
+ */
+function realFileUriFromDiffUri(uri) {
+  if (!uri || !uri.fsPath) return null;
+  try {
+    return vscode.Uri.file(uri.fsPath);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 尝试打开真实文件文档；不存在或打开失败时返回 null（调用方据此放弃导航）。
+ * @param {vscode.Uri} uri
+ * @returns {Promise<vscode.TextDocument|null>}
+ */
+async function tryOpenRealDocument(uri) {
+  try {
+    return await vscode.workspace.openTextDocument(uri);
+  } catch (e) {
+    return null;
+  }
+}
+
+// diff 文档与磁盘真实文件之间查找「相同文本行」的最大扫描窗口（避免大文件全量比对）。
+const DIFF_LINE_MATCH_WINDOW = 200;
+
+/**
+ * 把 diff 文档中的 position 映射到真实文件文档里的等价 position，逐级回退：
+ *   1. 真实文件同一行号存在且整行文本与 diff 文档一致 → 同行同列。
+ *   2. 否则在真实文件 ±DIFF_LINE_MATCH_WINDOW 行窗口内查找「整行文本相同」的最近行，
+ *      命中则取该行，列按原单词在行内的字符偏移定位（换行后仍能对准同一单词）。
+ *   3. 都未命中 → 回退到原始行列（裁剪到真实文档范围内），多数语言 provider 对列
+ *      的容错足够，仍可能命中所在符号。
+ * @param {vscode.TextDocument} diffDoc
+ * @param {vscode.Position} position
+ * @param {vscode.TextDocument} realDoc
+ * @returns {vscode.Position}
+ */
+function mapPositionToRealDocument(diffDoc, position, realDoc) {
+  const clampLine = (line) => Math.max(0, Math.min(line, realDoc.lineCount - 1));
+
+  let diffLineText = '';
+  try {
+    diffLineText = diffDoc.lineAt(position.line).text;
+  } catch (e) {
+    diffLineText = '';
+  }
+
+  // 单词在行内的字符偏移，换行匹配后按此偏移定位列，尽量对准同一单词。
+  const wordRange = diffDoc.getWordRangeAtPosition(position);
+  const wordOffsetInLine = wordRange ? wordRange.start.character : position.character;
+
+  // 1) 同行且文本一致：直接沿用原列。
+  const sameLine = clampLine(position.line);
+  try {
+    if (realDoc.lineAt(sameLine).text === diffLineText) {
+      return new vscode.Position(sameLine, position.character);
+    }
+  } catch (e) { /* 行号越界等，走后续回退 */ }
+
+  // 2) 就近窗口内查找整行文本相同的行。
+  if (diffLineText.length > 0) {
+    const start = Math.max(0, position.line - DIFF_LINE_MATCH_WINDOW);
+    const end = Math.min(realDoc.lineCount - 1, position.line + DIFF_LINE_MATCH_WINDOW);
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = start; i <= end; i++) {
+      let text;
+      try {
+        text = realDoc.lineAt(i).text;
+      } catch (e) {
+        continue;
+      }
+      if (text === diffLineText) {
+        const dist = Math.abs(i - position.line);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = i;
+        }
+      }
+    }
+    if (best >= 0) {
+      const col = Math.min(wordOffsetInLine, realDoc.lineAt(best).text.length);
+      return new vscode.Position(best, col);
+    }
+  }
+
+  // 3) 回退：原始行列，裁剪到真实文档范围内。
+  const fallbackLine = clampLine(position.line);
+  const fallbackCol = Math.min(position.character, realDoc.lineAt(fallbackLine).text.length);
+  return new vscode.Position(fallbackLine, fallbackCol);
+}
+
+/**
+ * 把 diff 文档 + position 桥接到真实文件后，委派给指定内置导航命令求解并返回结果。
+ * 任何一步失败（开关关闭、无真实文件、命令不存在等）都安全返回 undefined，
+ * VSCode 据此表现为「没有结果」而非报错。
+ * @param {vscode.TextDocument} document
+ * @param {vscode.Position} position
+ * @param {string} command 形如 'vscode.executeDefinitionProvider'
+ * @returns {Promise<any>}
+ */
+async function delegateToRealFile(document, position, command) {
+  if (!vscode.workspace.getConfiguration('claudeRef').get('enableDiffNavigation', true)) {
+    return undefined;
+  }
+  const realUri = realFileUriFromDiffUri(document.uri);
+  if (!realUri) return undefined;
+  const realDoc = await tryOpenRealDocument(realUri);
+  if (!realDoc) return undefined;
+  const realPosition = mapPositionToRealDocument(document, position, realDoc);
+  try {
+    return await vscode.commands.executeCommand(command, realUri, realPosition);
+  } catch (e) {
+    return undefined;
+  }
+}
+
+/**
+ * 桥接型 DefinitionProvider：diff 虚拟文档 → 真实文件 → vscode.executeDefinitionProvider。
+ * @implements {vscode.DefinitionProvider}
+ */
+class DiffDefinitionProvider {
+  provideDefinition(document, position) {
+    return delegateToRealFile(document, position, 'vscode.executeDefinitionProvider');
+  }
+}
+
+/**
+ * 桥接型 ReferenceProvider：diff 虚拟文档 → 真实文件 → vscode.executeReferenceProvider。
+ * @implements {vscode.ReferenceProvider}
+ */
+class DiffReferenceProvider {
+  provideReferences(document, position) {
+    return delegateToRealFile(document, position, 'vscode.executeReferenceProvider');
+  }
+}
+
+/**
+ * 桥接型 TypeDefinitionProvider：diff 虚拟文档 → 真实文件 → vscode.executeTypeDefinitionProvider。
+ * @implements {vscode.TypeDefinitionProvider}
+ */
+class DiffTypeDefinitionProvider {
+  provideTypeDefinition(document, position) {
+    return delegateToRealFile(document, position, 'vscode.executeTypeDefinitionProvider');
+  }
+}
+
+/**
+ * 桥接型 ImplementationProvider：diff 虚拟文档 → 真实文件 → vscode.executeImplementationProvider。
+ * @implements {vscode.ImplementationProvider}
+ */
+class DiffImplementationProvider {
+  provideImplementation(document, position) {
+    return delegateToRealFile(document, position, 'vscode.executeImplementationProvider');
+  }
+}
+
+/**
+ * 桥接型 HoverProvider：diff 虚拟文档 → 真实文件 → vscode.executeHoverProvider。
+ * @implements {vscode.HoverProvider}
+ */
+class DiffHoverProvider {
+  provideHover(document, position) {
+    return delegateToRealFile(document, position, 'vscode.executeHoverProvider');
+  }
+}
+
+/**
+ * 注册面向 Git diff 虚拟文档（git: scheme）的桥接导航 Provider：转到定义、查看引用、
+ * 转到类型定义、转到实现、悬停。是否生效由 claudeRef.enableDiffNavigation 在调用时
+ * 判断（delegateToRealFile），故配置变更无需重启即可生效；此处仅对存在的
+ * register* API 注册，旧版本 VSCode 缺失某项时静默跳过。
+ * @returns {vscode.Disposable[]}
+ */
+function registerDiffNavigationProviders() {
+  // git: 为 VSCode 内置 Git 扩展生成 diff 虚拟文档所用的 scheme，覆盖「与工作区版本对比」
+  // 与「历史版本间对比」两侧的原始内容视图。
+  const selector = { scheme: 'git' };
+  const disposables = [];
+
+  if (typeof vscode.languages.registerDefinitionProvider === 'function') {
+    disposables.push(vscode.languages.registerDefinitionProvider(selector, new DiffDefinitionProvider()));
+  }
+  if (typeof vscode.languages.registerReferenceProvider === 'function') {
+    disposables.push(vscode.languages.registerReferenceProvider(selector, new DiffReferenceProvider()));
+  }
+  if (typeof vscode.languages.registerTypeDefinitionProvider === 'function') {
+    disposables.push(vscode.languages.registerTypeDefinitionProvider(selector, new DiffTypeDefinitionProvider()));
+  }
+  if (typeof vscode.languages.registerImplementationProvider === 'function') {
+    disposables.push(vscode.languages.registerImplementationProvider(selector, new DiffImplementationProvider()));
+  }
+  if (typeof vscode.languages.registerHoverProvider === 'function') {
+    disposables.push(vscode.languages.registerHoverProvider(selector, new DiffHoverProvider()));
+  }
+
+  return disposables;
 }
 
 function deactivate() {}

@@ -2,7 +2,7 @@
   "name": "claude-ref-sender",
   "displayName": "Claude Ref Sender",
   "description": "在编辑器中选中代码，一键把 @path#Lstart-end 引用发送到正在运行 Claude Code CLI 的终端。",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "publisher": "ByteFunc",
   "license": "MIT",
   "icon": "icon.png",
@@ -222,12 +222,12 @@
         },
         "claudeRef.focusTerminalOnSend": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "发送引用后是否把焦点切换到终端。开启后点击 CodeLens 气泡或使用快捷键发送引用时，光标会直接落到终端；关闭则保持焦点停留在编辑器。"
         },
         "claudeRef.showSelectionCodeLens": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "在编辑器中选中代码时，于选区上方显示「💬 将选中引用添加到终端」的 CodeLens 气泡。关闭后不再显示该气泡，仍可用快捷键、右键菜单或命令面板发送选区引用。"
         },
         "claudeRef.requireClaudeRunning": {
@@ -237,7 +237,7 @@
         },
         "claudeRef.claudeCommandPattern": {
           "type": "string",
-          "default": "claude",
+          "default": "claude|claude-internal|tclaude",
           "description": "用于识别 Claude Code 的命令名（正则，不区分大小写）。命令不叫 claude 时（如 claude-other）按需修改，例如填写 'claude|claude-other' 以同时匹配两者。仅在开启 claudeRef.requireClaudeRunning 时生效。"
         },
         "claudeRef.notifyOnTurnEnd": {
@@ -325,6 +325,11 @@
           "type": "boolean",
           "default": false,
           "description": "Review 期间每次「接受/拒绝/撤销」后是否自动保存文件。关闭时文件保持未保存（dirty）状态，方便你用编辑器撤销；Review 结束时会统一保存。"
+        },
+        "claudeRef.enableDiffNavigation": {
+          "type": "boolean",
+          "default": true,
+          "description": "在 VSCode 内置 Git diff 视图（源代码管理里查看改动时的左右对比）中，为符号启用「转到定义」「查看引用」「转到类型定义」「转到实现」与悬停提示，效果与在普通编辑器中一致。关闭后 diff 视图内的这些导航将不再生效（不影响其他功能）。"
         }
       }
     }
